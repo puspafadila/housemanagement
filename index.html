@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Griya — Household Planner (Netlify + Supabase)</title>
+<title>Griya — Household Planner (Netlify + Supabase, no localStorage)</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.3/babel.min.js"></script>
@@ -302,6 +302,7 @@ const emptyData = () => ({
   health: [],
   education: [],
   educationTodos: [],
+  financialTodos: [],
   budget: {
     allocations: { belanja: 0, nanny: 0, kesehatan: 0, pendidikan: 0, lainnya: 0 },
     lainnyaItems: [],
@@ -316,8 +317,8 @@ const emptyData = () => ({
     savingsTypes: ["Tabungan", "Deposito", "Reksadana", "Saham", "Emas", "Lainnya"],
   },
   users: [
-    { id: uid(), username: "admin", password: "admin" },
-    { id: uid(), username: "puspa", password: "upskiLL100%" },
+    { id: uid(), username: "admin", password: "admin", role: "super_admin" },
+    { id: uid(), username: "puspa", password: "upskiLL100%", role: "super_admin" },
   ],
 });
 
@@ -369,21 +370,27 @@ const saveEducationPlanRemote = async (portfolios) => {
 // inside the claude.ai artifact sandbox, which blocks outbound fetch().
 const HOUSEHOLD_DATA_ROW_ID = "household";
 
+// Returns { ok:false } on network/server failure (never confuse with "empty"),
+// or { ok:true, data|null, updatedAt|null }.
 const fetchHouseholdDataRemote = async () => {
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/household_data?id=eq.${HOUSEHOLD_DATA_ROW_ID}&select=data`, {
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/household_data?id=eq.${HOUSEHOLD_DATA_ROW_ID}&select=data,updated_at`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Cache-Control": "no-cache" },
+      cache: "no-store",
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { ok: false };
     const rows = await res.json();
-    return rows && rows[0] ? rows[0].data : null;
+    const row = rows && rows[0];
+    return { ok: true, data: row ? row.data : null, updatedAt: row ? row.updated_at : null };
   } catch (err) {
-    return null;
+    return { ok: false };
   }
 };
 
+// Returns the new updated_at string on success, or null on failure.
 const saveHouseholdDataRemote = async (data) => {
   try {
+    const updatedAt = new Date().toISOString();
     const res = await fetch(`${SUPABASE_URL}/rest/v1/household_data`, {
       method: "POST",
       headers: {
@@ -392,12 +399,53 @@ const saveHouseholdDataRemote = async (data) => {
         "Content-Type": "application/json",
         Prefer: "resolution=merge-duplicates",
       },
-      body: JSON.stringify({ id: HOUSEHOLD_DATA_ROW_ID, data, updated_at: new Date().toISOString() }),
+      body: JSON.stringify({ id: HOUSEHOLD_DATA_ROW_ID, data, updated_at: updatedAt }),
     });
-    return res.ok;
+    return res.ok ? updatedAt : null;
   } catch (err) {
-    return false;
+    return null;
   }
+};
+
+// Three-way merge so two users saving at different times don't wipe each
+// other out: base = what this browser last loaded/saved, local = its edits,
+// remote = what's in Supabase now. Local edits win only where local != base.
+const isIdArray = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => x && typeof x === "object" && !Array.isArray(x) && x.id !== undefined);
+const sameJSON = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+const mergeThreeWay = (base, local, remote) => {
+  if (sameJSON(local, base)) return remote === undefined ? local : remote;
+  if (sameJSON(remote, base) || remote === undefined) return local;
+  const arrLike = (v) => Array.isArray(v) && (v.length === 0 || isIdArray(v));
+  if (arrLike(local) && arrLike(remote) && (base === undefined || arrLike(base))) {
+    const b = base || [];
+    const bm = new Map(b.map((x) => [x.id, x]));
+    const lm = new Map(local.map((x) => [x.id, x]));
+    const rm = new Map(remote.map((x) => [x.id, x]));
+    const out = [];
+    const seen = new Set();
+    const order = [...remote.map((x) => x.id), ...local.map((x) => x.id)];
+    order.forEach((id) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      const inB = bm.has(id), inL = lm.has(id), inR = rm.has(id);
+      if (inL && inR) out.push(inB ? mergeThreeWay(bm.get(id), lm.get(id), rm.get(id)) : lm.get(id));
+      else if (inL && !inR) { if (!inB) out.push(lm.get(id)); /* else: removed remotely */ }
+      else if (!inL && inR) { if (!inB) out.push(rm.get(id)); /* else: removed locally */ }
+    });
+    return out;
+  }
+  const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+  if (isObj(local) && isObj(remote)) {
+    const bb = isObj(base) ? base : {};
+    const out = {};
+    new Set([...Object.keys(remote), ...Object.keys(local)]).forEach((k) => {
+      if (!(k in local)) { if (!(k in bb)) out[k] = remote[k]; return; }
+      if (!(k in remote)) { if (!(k in bb)) out[k] = local[k]; return; }
+      out[k] = mergeThreeWay(bb[k], local[k], remote[k]);
+    });
+    return out;
+  }
+  return local;
 };
 
 /* ---------------------------------------------------------
@@ -451,44 +499,256 @@ function PageSaveBar({ dirty, saving, error, onSave }) {
 /* ---------------------------------------------------------
    Dashboard
 --------------------------------------------------------- */
-function Dashboard({ data, setTab }) {
-  const todoDone = data.todos.filter((t) => t.done).length;
-  const todoTotal = data.todos.length;
+/* ---------------------------------------------------------
+   Roles — who can see/edit which menu
+--------------------------------------------------------- */
+const ROLES = [
+  { value: "super_admin", label: "Super Admin" },
+  { value: "user", label: "User" },
+];
+const ROLE_TABS = {
+  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "masterdata", "usermanagement"],
+  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget"],
+};
+// Accounts created before roles existed keep full access (so nobody is locked out).
+const roleOf = (u) => (u && ROLE_TABS[u.role] ? u.role : "super_admin");
 
-  const kesehatanDone = data.health.filter((h) => h.status === "Selesai").length;
-  const kesehatanTotal = data.health.length;
+// Compact Rupiah for dashboard cards (e.g. Rp 2 M, Rp 450 jt).
+const rupiahShort = (n) => {
+  const v = Number(n) || 0;
+  const trim = (x) => String(Math.round(x * 10) / 10).replace(".", ",");
+  if (Math.abs(v) >= 1e9) return "Rp " + trim(v / 1e9) + " M";
+  if (Math.abs(v) >= 1e6) return "Rp " + trim(v / 1e6) + " jt";
+  return rupiah(v);
+};
 
-  const pendidikanDone = data.education.reduce((a, p) => a + eduPortfolioDone(p), 0);
-  const pendidikanTotal = data.education.length * EDU_STAGES.length;
+const FP_COLORS = ["#2F5D50", "#C79432", "#B85A38", "#6B7FA3", "#8E5C8A", "#5C7A54"];
 
-  // upcoming items across modules within next 10 days
+// Same ordering as the Financial Plan tab: prioritized goals first (lowest number), then the rest.
+const sortGoalsByPriority = (goals) =>
+  [...goals].sort((a, b) => {
+    const pa = a.priority === null || a.priority === undefined || a.priority === "" ? null : Number(a.priority);
+    const pb = b.priority === null || b.priority === undefined || b.priority === "" ? null : Number(b.priority);
+    if (pa !== null && pb !== null) return pa - pb;
+    if (pa !== null) return -1;
+    if (pb !== null) return 1;
+    return b.id > a.id ? 1 : -1;
+  });
+
+function FinancialPlanSummary({ goals, onOpen }) {
+  const [hover, setHover] = useState(null);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setReady(true), 60);
+    return () => clearTimeout(t);
+  }, []);
+
+  const list = sortGoalsByPriority(goals).map((g, i) => {
+    const target = Number(g.target) || 0;
+    const saved = goalSaved(g);
+    return { ...g, target, saved, pct: target > 0 ? Math.min(100, Math.round((saved / target) * 100)) : 0, color: FP_COLORS[i % FP_COLORS.length] };
+  });
+  const totalTarget = list.reduce((a, g) => a + g.target, 0);
+  const totalSaved = list.reduce((a, g) => a + Math.min(g.saved, g.target), 0);
+  const totalPct = totalTarget > 0 ? Math.round((totalSaved / totalTarget) * 100) : 0;
+
+  // Concentric rings: one ring per goal (outermost = highest priority), each filled to that goal's own %.
+  // (A single pie weighted by Rupiah would let one big goal hide all the small ones.)
+  const n = list.length;
+  const R0 = 19;
+  const step = n > 1 ? Math.min(4.1, (R0 - 11.5) / (n - 1)) : 0;
+  const stroke = n > 1 ? Math.min(3.3, step * 0.78) : 3.3;
+  const rings = list.map((g, i) => ({ id: g.id, color: g.color, pct: g.pct, r: R0 - i * step }));
+
+  return (
+    <div className="card fp-card" role="button" tabIndex={0} onClick={onOpen} onKeyDown={(e) => e.key === "Enter" && onOpen()}>
+      <div className="fp-head">
+        <div>
+          <h2>Financial Plan</h2>
+          {list.length > 0 && (
+            <p className="fp-sub">
+              {rupiah(totalSaved)} terkumpul dari target {rupiah(totalTarget)}
+            </p>
+          )}
+        </div>
+        <span className="fp-link">Lihat detail →</span>
+      </div>
+
+      {list.length === 0 ? (
+        <EmptyState icon={Wallet} title="Belum ada tujuan keuangan" hint="Tambahkan tujuan di Financial → Financial Plan untuk melihat progresnya di sini." />
+      ) : (
+        <div className="fp-body">
+          <div className="fp-donut">
+            <svg viewBox="0 0 42 42" role="img" aria-label={`Progres Financial Plan ${totalPct} persen`}>
+              {rings.map((g) => (
+                <g key={g.id} style={{ opacity: hover && hover !== g.id ? 0.3 : 1, transition: "opacity .15s" }}>
+                  <circle cx="21" cy="21" r={g.r} fill="none" stroke="var(--track)" strokeWidth={stroke} />
+                  <circle
+                    cx="21"
+                    cy="21"
+                    r={g.r}
+                    fill="none"
+                    stroke={g.color}
+                    strokeWidth={hover === g.id ? stroke + 0.9 : stroke}
+                    strokeLinecap="round"
+                    pathLength="100"
+                    transform="rotate(-90 21 21)"
+                    strokeDasharray={`${ready ? Math.max(g.pct, g.pct > 0 ? 0.8 : 0) : 0} 100`}
+                    style={{ transition: "stroke-dasharray .9s cubic-bezier(.2,.8,.2,1), stroke-width .15s" }}
+                  />
+                </g>
+              ))}
+            </svg>
+            <div className="fp-center">
+              <span className="fp-pct">{totalPct}%</span>
+              <span className="fp-pct-label">total tercapai</span>
+            </div>
+          </div>
+
+          <ul className="fp-legend">
+            {list.map((g) => (
+              <li key={g.id} onMouseEnter={() => setHover(g.id)} onMouseLeave={() => setHover(null)} className={hover && hover !== g.id ? "dim" : ""}>
+                <div className="fp-row-top">
+                  <span className="fp-dot" style={{ background: g.color }} />
+                  <span className="fp-name">{g.name || "(tanpa nama)"}</span>
+                  {g.priority !== "" && g.priority !== null && g.priority !== undefined && <span className="fp-prio">Prioritas {g.priority}</span>}
+                  <span className="fp-gpct" style={{ color: g.color }}>
+                    {g.pct}%
+                  </span>
+                </div>
+                <div className="fp-bar">
+                  <div style={{ width: (ready ? g.pct : 0) + "%", background: g.color }} />
+                </div>
+                <div className="fp-row-sub">
+                  {rupiah(g.saved)} / {rupiah(g.target)}
+                  {g.targetDate ? ` · target ${fmtDate(g.targetDate)}` : ""}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Dashboard({ data, setTab, openFinancialPlan }) {
+  const periods = (data.nanny && data.nanny.periods) || [];
+  const goals = (data.financial && data.financial.goals) || [];
+  const eduTasks = (data.educationTodos || []).map(normalizeTask);
+  const finTasks = (data.financialTodos || []).map(normalizeTask);
+  const taskStats = (list) => {
+    const active = list.filter((t) => t.status !== "Cancelled");
+    return { done: active.filter((t) => t.status === "Complete").length, total: active.length };
+  };
+  const isOpenTask = (t) => t.status !== "Complete" && t.status !== "Cancelled";
+
+  // ---- Payroll
+  const periodSalary = (p) => {
+    const dates = datesInRange(p.startDate, p.endDate);
+    const a = dates.filter((dt) => p.attendance && p.attendance[dt] === "A").length;
+    const b = dates.filter((dt) => p.attendance && p.attendance[dt] === "B").length;
+    return a * (Number(p.rateA) || 0) + b * (Number(p.rateB) || 0);
+  };
+  const payrollPaid = periods.filter((p) => p.dibayar).length;
+  const unpaid = periods.filter((p) => !p.dibayar).sort((a, b) => (b.endDate || "").localeCompare(a.endDate || ""));
+  const currentPeriod = unpaid[0];
+
+  // ---- Health
+  const healthDone = data.health.filter((h) => h.status === "Selesai").length;
+  const reimburseOutstanding = data.health.reduce(
+    (n, h) => n + (reimburseValue(h.reimburseBlibli) !== "Paid" ? 1 : 0) + (reimburseValue(h.reimburseAdmedika) !== "Paid" ? 1 : 0),
+    0
+  );
+  const healthPending = data.health.filter((h) => h.status !== "Selesai").length;
+
+  // ---- Education
+  const eduTodo = taskStats(eduTasks);
+  const eduPortDone = data.education.reduce((a, p) => a + eduPortfolioDone(p), 0);
+  const eduPortTotal = data.education.length * EDU_STAGES.length;
+
+  // ---- Financial
+  const finTodo = taskStats(finTasks);
+  const totalTarget = goals.reduce((a, g) => a + (Number(g.target) || 0), 0);
+  const totalSaved = goals.reduce((a, g) => a + goalSaved(g), 0);
+  const finPct = totalTarget > 0 ? Math.min(100, Math.round((totalSaved / totalTarget) * 100)) : 0;
+
   const upcoming = useMemo(() => {
     const items = [];
-    data.todos.forEach((t) => {
-      if (!t.done && t.dueDate) items.push({ label: t.text, date: t.dueDate, kind: "To-Do", tab: "todo" });
+    periods.forEach((p) => {
+      if (!p.dibayar && p.endDate)
+        items.push({ label: `Gaji nanny · ${fmtDate(p.startDate)}–${fmtDate(p.endDate)}`, date: p.endDate, kind: "Payroll", tab: "nanny" });
     });
     data.health.forEach((h) => {
       if (h.status !== "Selesai" && h.date)
-        items.push({ label: `${h.memberName} · ${h.type}`, date: h.date, kind: "Kesehatan", tab: "kesehatan" });
+        items.push({ label: [h.memberName, h.hospital || h.type].filter(Boolean).join(" · "), date: h.date, kind: "Health", tab: "kesehatan" });
     });
-    (data.educationTodos || []).forEach((e) => {
-      if (e.status !== "Selesai" && e.targetDate)
-        items.push({ label: `${e.childName} · ${e.item}`, date: e.targetDate, kind: "Pendidikan", tab: "pendidikan" });
+    eduTasks.forEach((t) => {
+      if (isOpenTask(t) && t.dueDate) items.push({ label: t.task || "(tanpa nama)", date: t.dueDate, kind: "Education", tab: "pendidikan" });
     });
-    (data.nanny.periods || []).forEach((p) => {
-      if (!p.dibayar && p.endDate) items.push({ label: `Gaji nanny · ${fmtDate(p.startDate)}–${fmtDate(p.endDate)}`, date: p.endDate, kind: "Nanny", tab: "nanny" });
+    finTasks.forEach((t) => {
+      if (isOpenTask(t) && t.dueDate) items.push({ label: t.task || "(tanpa nama)", date: t.dueDate, kind: "Financial", tab: "budget" });
+    });
+    goals.forEach((g) => {
+      if (g.targetDate && goalSaved(g) < (Number(g.target) || 0))
+        items.push({ label: `Target tabungan · ${g.name}`, date: g.targetDate, kind: "Financial", tab: "budget" });
     });
     return items
       .map((i) => ({ ...i, d: daysUntil(i.date) }))
       .filter((i) => i.d !== null && i.d >= -1 && i.d <= 14)
       .sort((a, b) => a.d - b.d)
-      .slice(0, 8);
+      .slice(0, 10);
   }, [data]);
 
-  const stats = [
-    { key: "todo", label: "To-Do Rumah", done: todoDone, total: todoTotal, icon: CheckSquare, color: "var(--pine)" },
-    { key: "kesehatan", label: "Health", done: kesehatanDone, total: kesehatanTotal, icon: HeartPulse, color: "var(--clay)" },
-    { key: "pendidikan", label: "Education", done: pendidikanDone, total: pendidikanTotal, icon: GraduationCap, color: "var(--sage-dark)" },
+  const cards = [
+    {
+      key: "nanny",
+      label: "Payroll",
+      icon: Users,
+      color: "var(--sage-dark)",
+      done: payrollPaid,
+      total: periods.length,
+      unit: "periode dibayar",
+      lines: currentPeriod
+        ? [`Periode berjalan: ${rupiah(periodSalary(currentPeriod))}`, `${fmtDate(currentPeriod.startDate)} – ${fmtDate(currentPeriod.endDate)} · belum dibayar`]
+        : periods.length
+        ? ["Semua periode sudah dibayar"]
+        : [],
+    },
+    {
+      key: "kesehatan",
+      label: "Health",
+      icon: HeartPulse,
+      color: "var(--clay)",
+      done: healthDone,
+      total: data.health.length,
+      unit: "jadwal selesai",
+      lines: data.health.length ? [`${healthPending} jadwal belum selesai`, `${reimburseOutstanding} reimburse belum Paid`] : [],
+    },
+    {
+      key: "pendidikan",
+      label: "Education",
+      icon: GraduationCap,
+      color: "var(--pine)",
+      done: eduTodo.done,
+      total: eduTodo.total,
+      unit: "to-do selesai",
+      lines: eduPortTotal > 0 ? [`Portofolio: ${eduPortDone} / ${eduPortTotal} jenjang selesai`] : [],
+    },
+    {
+      key: "budget",
+      label: "Financial",
+      icon: Wallet,
+      color: "var(--mustard)",
+      done: finPct,
+      total: totalTarget > 0 ? 100 : 0,
+      unit: "% tabungan terkumpul",
+      bigSuffix: "%",
+      lines: [
+        ...(totalTarget > 0 ? [`${rupiahShort(totalSaved)} dari ${rupiahShort(totalTarget)}`] : []),
+        ...(finTodo.total > 0 ? [`To-Do: ${finTodo.done} / ${finTodo.total} selesai`] : []),
+      ],
+    },
   ];
 
   return (
@@ -500,8 +760,10 @@ function Dashboard({ data, setTab }) {
         </p>
       </div>
 
+      <FinancialPlanSummary goals={goals} onOpen={openFinancialPlan || (() => setTab("budget"))} />
+
       <div className="stat-grid">
-        {stats.map((s) => (
+        {cards.map((s) => (
           <button key={s.key} className="stat-card" onClick={() => setTab(s.key)}>
             <div className="stat-top">
               <span className="stat-icon" style={{ color: s.color }}>
@@ -514,12 +776,20 @@ function Dashboard({ data, setTab }) {
                 <span className="stat-empty">Belum ada data</span>
               ) : (
                 <>
-                  <span className="big">{s.done}</span>
-                  <span className="of">/ {s.total} selesai</span>
+                  <span className="big">
+                    {s.done}
+                    {s.bigSuffix || ""}
+                  </span>
+                  <span className="of">{s.bigSuffix ? "terkumpul" : `/ ${s.total} ${s.unit.replace(/^% /, "")}`}</span>
                 </>
               )}
             </div>
             <ProgressBar value={s.done} max={Math.max(s.total, 1)} color={s.color} />
+            <div className="stat-lines">
+              {s.lines.map((l, i) => (
+                <span key={i}>{l}</span>
+              ))}
+            </div>
           </button>
         ))}
       </div>
@@ -956,28 +1226,63 @@ function NannyTab({ data, update, appSave }) {
 /* ---------------------------------------------------------
    Kesehatan (Health) Tab
 --------------------------------------------------------- */
+const REIMBURSE_OPTIONS = [
+  { value: "Need submission", color: "#c0392b" },
+  { value: "On review", color: "#c0392b" },
+  { value: "Waiting for payment", color: "#c0392b" },
+  { value: "Paid", color: "#1e8449" },
+];
+// Older records stored a checkbox (true/false); map them onto the new list.
+const reimburseValue = (v) => (v === true ? "Paid" : REIMBURSE_OPTIONS.some((o) => o.value === v) ? v : "Need submission");
+const reimburseColor = (v) => (REIMBURSE_OPTIONS.find((o) => o.value === reimburseValue(v)) || REIMBURSE_OPTIONS[0]).color;
+
+function ReimburseSelect({ label, value, onChange, small }) {
+  const v = reimburseValue(value);
+  return (
+    <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: small ? 11.5 : 13, whiteSpace: "nowrap" }}>
+      {label}
+      <select value={v} onChange={(e) => onChange(e.target.value)} style={{ color: reimburseColor(v), fontWeight: 400, fontSize: small ? 11.5 : 13, fontFamily: "'Inter',sans-serif", ...(small ? { padding: "2px 4px", borderRadius: 6, border: "1px solid var(--line)", background: "var(--card)" } : {}) }}>
+        {REIMBURSE_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value} style={{ color: o.color }}>
+            {o.value}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function KesehatanTab({ data, update, appSave }) {
   const [memberName, setMemberName] = useState("");
-  const [type, setType] = useState("Dokter Umum");
+  const [hospital, setHospital] = useState("");
+  const [diagnosis, setDiagnosis] = useState("");
+  const [nominal, setNominal] = useState("");
+  const [reimburseBlibli, setReimburseBlibli] = useState("Need submission");
+  const [reimburseAdmedika, setReimburseAdmedika] = useState("Need submission");
   const [date, setDate] = useState(todayISO());
-  const [pic, setPic] = useState("");
-  const [notes, setNotes] = useState("");
-
-  const types = (data.masterData && data.masterData.healthTypes) || ["Dokter Umum", "Gigi", "Vaksinasi", "Mata", "Lab / Cek Darah", "Spesialis Anak", "Lainnya"];
 
   const add = () => {
     if (!memberName.trim()) return;
     update((d) => ({
       ...d,
       health: [
-        { id: uid(), memberName: memberName.trim(), type, date, pic: pic.trim(), notes, status: "Terjadwal" },
+        { id: uid(), memberName: memberName.trim(), hospital: hospital.trim(), diagnosis: diagnosis.trim(), nominal: Number(nominal) || 0, reimburseBlibli, reimburseAdmedika, date, status: "Terjadwal" },
         ...d.health,
       ],
     }));
     setMemberName("");
-    setPic("");
-    setNotes("");
+    setHospital("");
+    setDiagnosis("");
+    setNominal("");
+    setReimburseBlibli("Need submission");
+    setReimburseAdmedika("Need submission");
   };
+
+  const setReimburse = (id, field, value) =>
+    update((d) => ({
+      ...d,
+      health: d.health.map((h) => (h.id === id ? { ...h, [field]: value } : h)),
+    }));
 
   const toggleStatus = (id) =>
     update((d) => ({
@@ -998,15 +1303,17 @@ function KesehatanTab({ data, update, appSave }) {
       <PageSaveBar {...appSave} />
 
       <div className="add-form wrap">
-        <input placeholder="Nama anggota keluarga…" value={memberName} onChange={(e) => setMemberName(e.target.value)} className="grow" />
-        <select value={type} onChange={(e) => setType(e.target.value)}>
-          {types.map((t) => (
-            <option key={t}>{t}</option>
-          ))}
-        </select>
+        <input placeholder="Keterangan…" value={memberName} onChange={(e) => setMemberName(e.target.value)} className="grow" />
+        <input placeholder="Rumah Sakit" value={hospital} onChange={(e) => setHospital(e.target.value)} style={{ width: 160 }} />
+        <input placeholder="Diagnosa" value={diagnosis} onChange={(e) => setDiagnosis(e.target.value)} style={{ width: 160 }} />
+        <div className="rp-input small" style={{ width: 150, height: 36, boxSizing: "border-box", padding: "0 10px", borderRadius: 7, background: "var(--card)" }}>
+          <span>Rp</span>
+          <input placeholder="Nominal" inputMode="numeric" value={nominal ? Number(nominal).toLocaleString("id-ID") : ""} onChange={(e) => setNominal(e.target.value.replace(/\D/g, ""))} />
+        </div>
         <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-        <input placeholder="PIC" value={pic} onChange={(e) => setPic(e.target.value)} style={{ width: 120 }} />
-        <input placeholder="Catatan (opsional)" value={notes} onChange={(e) => setNotes(e.target.value)} style={{ width: 160 }} />
+        <div style={{ flexBasis: "100%", height: 0 }} />
+        <ReimburseSelect small label="Reimburse Admedika" value={reimburseAdmedika} onChange={setReimburseAdmedika} />
+        <ReimburseSelect small label="Reimburse Blibli" value={reimburseBlibli} onChange={setReimburseBlibli} />
         <button type="button" className="btn-primary" onClick={add}>
           <Plus size={16} /> Tambah
         </button>
@@ -1025,12 +1332,17 @@ function KesehatanTab({ data, update, appSave }) {
                 </button>
                 <div className="list-main">
                   <span className="list-title">
-                    {h.memberName} <span className="qty">· {h.type}</span>
+                    {h.memberName}
+                    {(h.hospital || h.type) && <span className="qty"> · {h.hospital || h.type}</span>}
                   </span>
                   <span className="list-meta">
                     <span className={"due" + (h.status !== "Selesai" && d < 0 ? " overdue" : "")}>{fmtDate(h.date)}</span>
-                    {h.pic && <span className="due">PIC: {h.pic}</span>}
-                    {h.notes && <span className="due">{h.notes}</span>}
+                    {h.diagnosis && <span className="due">Diagnosa: {h.diagnosis}</span>}
+                    {Number(h.nominal) > 0 && <span className="due">Nominal: {rupiah(h.nominal)}</span>}
+                  </span>
+                  <span className="list-meta" style={{ marginTop: 6 }}>
+                    <ReimburseSelect small label="Admedika" value={h.reimburseAdmedika} onChange={(v) => setReimburse(h.id, "reimburseAdmedika", v)} />
+                    <ReimburseSelect small label="Blibli" value={h.reimburseBlibli} onChange={(v) => setReimburse(h.id, "reimburseBlibli", v)} />
                   </span>
                 </div>
                 <button className="icon-btn" onClick={() => remove(h.id)}>
@@ -1083,86 +1395,333 @@ function EduStageRow({ stage, data, onChange }) {
   );
 }
 
-function EducationTodoSection({ data, update, appSave }) {
-  const [childName, setChildName] = useState("");
-  const [item, setItem] = useState("");
-  const [targetDate, setTargetDate] = useState("");
-  const [pic, setPic] = useState("");
-  const [notes, setNotes] = useState("");
+const TASK_STATUSES = ["Open", "In Progress", "Complete", "Cancelled", "Hold"];
 
-  const add = () => {
-    if (!childName.trim() || !item.trim()) return;
-    update((d) => ({
-      ...d,
-      educationTodos: [
-        { id: uid(), childName: childName.trim(), item: item.trim(), targetDate, pic: pic.trim(), notes, status: "Berjalan" },
-        ...(d.educationTodos || []),
-      ],
-    }));
-    setChildName("");
-    setItem("");
-    setTargetDate("");
-    setPic("");
-    setNotes("");
-  };
+// Older to-do rows (before the table layout) used item/childName/targetDate and
+// Berjalan/Selesai — read them as Task / Due Date / Status so nothing is lost.
+const normalizeTask = (t) => ({
+  id: t.id,
+  task: t.task !== undefined ? t.task : [t.item, t.childName].filter(Boolean).join(" · "),
+  pic: t.pic || "",
+  dueDate: t.dueDate !== undefined ? t.dueDate : t.targetDate || "",
+  status: TASK_STATUSES.includes(t.status) ? t.status : t.status === "Selesai" ? "Complete" : "Open",
+});
 
-  const toggleStatus = (id) =>
-    update((d) => ({
-      ...d,
-      educationTodos: (d.educationTodos || []).map((e) => (e.id === id ? { ...e, status: e.status === "Selesai" ? "Berjalan" : "Selesai" } : e)),
-    }));
-  const remove = (id) => update((d) => ({ ...d, educationTodos: (d.educationTodos || []).filter((e) => e.id !== id) }));
+const TASK_STATUS_COLORS = {
+  Open: "#d9822b",
+  "In Progress": "#1e8449",
+  Complete: "#8a8a8a",
+  Cancelled: "#8a8a8a",
+  Hold: "#d9822b",
+};
 
-  const sorted = [...(data.educationTodos || [])].sort((a, b) =>
-    a.status === b.status ? (a.targetDate || "9999").localeCompare(b.targetDate || "9999") : a.status === "Selesai" ? 1 : -1
+// Set of "listKey:rowId" for rows that must be completed before saving (App fills it in).
+const TaskValidationContext = React.createContext({ show: false, ids: new Set() });
+
+const isTaskRowIncomplete = (r) => !(r.task || "").trim() || !r.pic || !r.dueDate;
+
+// Only rows that are new or edited since the last save are checked, so old
+// rows that were already saved with blanks don't block anything.
+const findIncompleteTasks = (data, savedJSON) => {
+  const ids = new Set();
+  let saved = {};
+  try {
+    saved = savedJSON ? JSON.parse(savedJSON) : {};
+  } catch (e) {}
+  ["educationTodos", "financialTodos"].forEach((key) => {
+    const before = new Map(((saved && saved[key]) || []).map(normalizeTask).map((r) => [r.id, JSON.stringify(r)]));
+    ((data && data[key]) || []).map(normalizeTask).forEach((r) => {
+      if (isTaskRowIncomplete(r) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
+    });
+  });
+  return ids;
+};
+
+const FilterIcon = ({ active }) => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill={active ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+  </svg>
+);
+const SortIcon = ({ dir }) => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M7 4v16M7 4L3.5 7.5M7 4l3.5 3.5" opacity={dir === "desc" ? 0.3 : 1} />
+    <path d="M17 20V4M17 20l-3.5-3.5M17 20l3.5-3.5" opacity={dir === "asc" ? 0.3 : 1} />
+  </svg>
+);
+
+function ColumnHeader({ label, width, sortDir, onSort, filterActive, filterContent, onResetFilter }) {
+  const [pos, setPos] = useState(null);
+  const popRef = useRef(null);
+
+  useEffect(() => {
+    if (!pos) return;
+    const close = (e) => {
+      if (popRef.current && popRef.current.contains(e.target)) return;
+      setPos(null);
+    };
+    const closeOnScroll = () => setPos(null);
+    document.addEventListener("mousedown", close);
+    window.addEventListener("resize", closeOnScroll);
+    window.addEventListener("scroll", closeOnScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("resize", closeOnScroll);
+      window.removeEventListener("scroll", closeOnScroll, true);
+    };
+  }, [pos]);
+
+  return (
+    <th style={width ? { width } : undefined}>
+      <span className="th-inner">
+        <span>{label}</span>
+        <span className="th-actions">
+          <button type="button" className={"th-btn" + (sortDir ? " on" : "")} title="Sort" onClick={onSort}>
+            <SortIcon dir={sortDir} />
+          </button>
+          {filterContent && (
+            <button
+              type="button"
+              className={"th-btn" + (filterActive ? " on" : "")}
+              title="Filter"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                setPos(pos ? null : { left: Math.max(8, Math.min(r.left, window.innerWidth - 240)), top: r.bottom + 6 });
+              }}
+            >
+              <FilterIcon active={filterActive} />
+            </button>
+          )}
+        </span>
+      </span>
+      {pos && filterContent && (
+        <div className="th-pop" ref={popRef} style={{ left: pos.left, top: pos.top }}>
+          {filterContent}
+          <button type="button" className="th-reset" onClick={onResetFilter}>
+            Reset filter
+          </button>
+        </div>
+      )}
+    </th>
   );
+}
+
+const EMPTY_TASK_FILTERS = { task: "", pic: "", dueFrom: "", dueTo: "", status: [] };
+
+function TaskTableSection({ listKey, data, update, appSave }) {
+  const validation = React.useContext(TaskValidationContext);
+  const rows = (data[listKey] || []).map(normalizeTask);
+  const users = data.users || [];
+  const roleLabel = (u) => (ROLES.find((r) => r.value === roleOf(u)) || ROLES[0]).label;
+
+  const [sort, setSort] = useState({ key: null, dir: null });
+  const [filters, setFilters] = useState(EMPTY_TASK_FILTERS);
+  const setFilter = (patch) => setFilters((f) => ({ ...f, ...patch }));
+
+  const setRows = (fn) => update((d) => ({ ...d, [listKey]: fn((d[listKey] || []).map(normalizeTask)) }));
+  const filtersActive = {
+    task: !!filters.task.trim(),
+    pic: !!filters.pic,
+    dueDate: !!(filters.dueFrom || filters.dueTo),
+    status: filters.status.length > 0,
+  };
+  const anyFilter = Object.values(filtersActive).some(Boolean);
+
+  const addRow = () => {
+    setFilters(EMPTY_TASK_FILTERS); // so the new (empty) row is never hidden by a filter
+    setRows((list) => [...list, { id: uid(), task: "", pic: "", dueDate: "", status: "Open" }]);
+  };
+  const editRow = (id, field, value) => setRows((list) => list.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
+  const removeRow = (id) => setRows((list) => list.filter((r) => r.id !== id));
+
+  const cycleSort = (key) =>
+    setSort((s) => (s.key !== key ? { key, dir: "asc" } : s.dir === "asc" ? { key, dir: "desc" } : { key: null, dir: null }));
+
+  // View only — sorting/filtering never changes the saved data or its order.
+  let view = rows.map((r, i) => ({ ...r, _i: i }));
+  view = view.filter((r) => {
+    if (filtersActive.task && !r.task.toLowerCase().includes(filters.task.trim().toLowerCase())) return false;
+    if (filtersActive.pic && (filters.pic === "__blank__" ? r.pic : r.pic !== filters.pic)) return false;
+    if (filters.dueFrom && (!r.dueDate || r.dueDate < filters.dueFrom)) return false;
+    if (filters.dueTo && (!r.dueDate || r.dueDate > filters.dueTo)) return false;
+    if (filtersActive.status && !filters.status.includes(r.status)) return false;
+    return true;
+  });
+  if (sort.key) {
+    const val = (r) => (sort.key === "no" ? r._i : sort.key === "status" ? TASK_STATUSES.indexOf(r.status) : (r[sort.key] || "").toString().toLowerCase());
+    const dir = sort.dir === "asc" ? 1 : -1;
+    view.sort((a, b) => {
+      const va = val(a), vb = val(b);
+      const ea = va === "", eb = vb === "";
+      if (ea || eb) return ea === eb ? a._i - b._i : ea ? 1 : -1; // blanks always last
+      return va < vb ? -dir : va > vb ? dir : a._i - b._i;
+    });
+  }
+  const dirOf = (k) => (sort.key === k ? sort.dir : null);
+
+  const cellErr = (r, empty) => validation.show && validation.ids.has(listKey + ":" + r.id) && empty;
 
   return (
     <>
       <PageSaveBar {...appSave} />
 
-      <div className="add-form wrap">
-        <input placeholder="Nama anak…" value={childName} onChange={(e) => setChildName(e.target.value)} style={{ width: 150 }} />
-        <input placeholder="Rencana, mis. Daftar SD, Les Matematika…" value={item} onChange={(e) => setItem(e.target.value)} className="grow" />
-        <input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
-        <input placeholder="PIC" value={pic} onChange={(e) => setPic(e.target.value)} style={{ width: 120 }} />
-        <input placeholder="Catatan (opsional)" value={notes} onChange={(e) => setNotes(e.target.value)} style={{ width: 160 }} />
-        <button type="button" className="btn-primary" onClick={add}>
-          <Plus size={16} /> Tambah
-        </button>
+      <div className="task-table-wrap">
+        <table className="task-table">
+          <thead>
+            <tr>
+              <ColumnHeader label="No" width={58} sortDir={dirOf("no")} onSort={() => cycleSort("no")} />
+              <ColumnHeader
+                label="Task"
+                sortDir={dirOf("task")}
+                onSort={() => cycleSort("task")}
+                filterActive={filtersActive.task}
+                onResetFilter={() => setFilter({ task: "" })}
+                filterContent={
+                  <input autoFocus placeholder="Cari task…" value={filters.task} onChange={(e) => setFilter({ task: e.target.value })} />
+                }
+              />
+              <ColumnHeader
+                label="PIC"
+                width={172}
+                sortDir={dirOf("pic")}
+                onSort={() => cycleSort("pic")}
+                filterActive={filtersActive.pic}
+                onResetFilter={() => setFilter({ pic: "" })}
+                filterContent={
+                  <select value={filters.pic} onChange={(e) => setFilter({ pic: e.target.value })}>
+                    <option value="">Semua</option>
+                    <option value="__blank__">(Kosong)</option>
+                    {users.map((u) => (
+                      <option key={u.id} value={u.username}>
+                        {u.username} ({roleLabel(u)})
+                      </option>
+                    ))}
+                  </select>
+                }
+              />
+              <ColumnHeader
+                label="Due Date"
+                width={134}
+                sortDir={dirOf("dueDate")}
+                onSort={() => cycleSort("dueDate")}
+                filterActive={filtersActive.dueDate}
+                onResetFilter={() => setFilter({ dueFrom: "", dueTo: "" })}
+                filterContent={
+                  <div className="th-pop-col">
+                    <label>
+                      Dari
+                      <input type="date" value={filters.dueFrom} onChange={(e) => setFilter({ dueFrom: e.target.value })} />
+                    </label>
+                    <label>
+                      Sampai
+                      <input type="date" value={filters.dueTo} onChange={(e) => setFilter({ dueTo: e.target.value })} />
+                    </label>
+                  </div>
+                }
+              />
+              <ColumnHeader
+                label="Status"
+                width={118}
+                sortDir={dirOf("status")}
+                onSort={() => cycleSort("status")}
+                filterActive={filtersActive.status}
+                onResetFilter={() => setFilter({ status: [] })}
+                filterContent={
+                  <div className="th-pop-col">
+                    {TASK_STATUSES.map((s) => (
+                      <label key={s} className="th-check" style={{ color: TASK_STATUS_COLORS[s] }}>
+                        <input
+                          type="checkbox"
+                          checked={filters.status.includes(s)}
+                          onChange={(e) => setFilter({ status: e.target.checked ? [...filters.status, s] : filters.status.filter((x) => x !== s) })}
+                        />
+                        {s}
+                      </label>
+                    ))}
+                  </div>
+                }
+              />
+              <th style={{ width: 36 }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {view.length === 0 && (
+              <tr>
+                <td colSpan={6} className="task-empty">
+                  {rows.length === 0 ? 'Belum ada task. Klik "Tambah Baris" untuk menambahkan.' : "Tidak ada baris yang cocok dengan filter."}
+                </td>
+              </tr>
+            )}
+            {view.map((r, i) => {
+              const color = TASK_STATUS_COLORS[r.status];
+              return (
+                <tr key={r.id}>
+                  <td className="task-no">{i + 1}</td>
+                  <td>
+                    <input
+                      className={cellErr(r, !r.task.trim()) ? "cell-err" : ""}
+                      value={r.task}
+                      placeholder="Task…"
+                      onChange={(e) => editRow(r.id, "task", e.target.value)}
+                    />
+                  </td>
+                  <td>
+                    <select className={cellErr(r, !r.pic) ? "cell-err" : ""} value={r.pic} onChange={(e) => editRow(r.id, "pic", e.target.value)}>
+                      <option value="">— pilih PIC —</option>
+                      {r.pic && !users.some((u) => u.username === r.pic) && <option value={r.pic}>{r.pic}</option>}
+                      {users.map((u) => (
+                        <option key={u.id} value={u.username}>
+                          {u.username} ({roleLabel(u)})
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <input
+                      className={cellErr(r, !r.dueDate) ? "cell-err" : ""}
+                      type="date"
+                      value={r.dueDate}
+                      onChange={(e) => editRow(r.id, "dueDate", e.target.value)}
+                    />
+                  </td>
+                  <td>
+                    <select
+                      value={r.status}
+                      onChange={(e) => editRow(r.id, "status", e.target.value)}
+                      style={{ color, fontWeight: 600, background: color + "1f", borderColor: color + "66" }}
+                    >
+                      {TASK_STATUSES.map((s) => (
+                        <option key={s} style={{ color: TASK_STATUS_COLORS[s], background: "#fff" }}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <button className="icon-btn" onClick={() => removeRow(r.id)} title="Hapus baris">
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
-
-      {sorted.length === 0 ? (
-        <EmptyState icon={GraduationCap} title="Belum ada rencana pendidikan" hint="Tambahkan rencana pendidikan untuk anak-anak di sini." />
-      ) : (
-        <ul className="list">
-          {sorted.map((e) => {
-            const d = e.targetDate ? daysUntil(e.targetDate) : null;
-            return (
-              <li key={e.id} className={"list-row" + (e.status === "Selesai" ? " done" : "")}>
-                <button className={"check" + (e.status === "Selesai" ? " checked" : "")} onClick={() => toggleStatus(e.id)}>
-                  {e.status === "Selesai" && <Check size={13} strokeWidth={3} />}
-                </button>
-                <div className="list-main">
-                  <span className="list-title">
-                    {e.item} <span className="qty">· {e.childName}</span>
-                  </span>
-                  <span className="list-meta">
-                    {e.targetDate && <span className={"due" + (e.status !== "Selesai" && d < 0 ? " overdue" : "")}>{fmtDate(e.targetDate)}</span>}
-                    {e.pic && <span className="due">PIC: {e.pic}</span>}
-                    {e.notes && <span className="due">{e.notes}</span>}
-                  </span>
-                </div>
-                <button className="icon-btn" onClick={() => remove(e.id)}>
-                  <Trash2 size={15} />
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+      {anyFilter && (
+        <p className="empty-hint" style={{ marginTop: 8, textAlign: "left" }}>
+          Menampilkan {view.length} dari {rows.length} baris (filter aktif).
+        </p>
       )}
+      <button type="button" className="btn-primary" onClick={addRow} style={{ marginTop: 12 }}>
+        <Plus size={16} /> Tambah Baris
+      </button>
     </>
   );
+}
+
+function EducationTodoSection({ data, update, appSave }) {
+  return <TaskTableSection listKey="educationTodos" data={data} update={update} appSave={appSave} />;
 }
 
 function EducationPlanSection({ data, update, dirty, saving, lastSavedAt, saveError, onSave }) {
@@ -1297,7 +1856,7 @@ function PendidikanTab({ data, update, subTab, setSubTab, eduPlanDirty, eduSavin
 /* ---------------------------------------------------------
    Financial Tab — savings goals (tracking) + long-term projections
 --------------------------------------------------------- */
-function GoalCard({ goal, expanded, onToggleExpand, onRemove, onAddContribution, onRemoveContribution }) {
+function GoalCard({ goal, expanded, onToggleExpand, onRemove, onUpdateField, onAddContribution, onRemoveContribution }) {
   const [contribDate, setContribDate] = useState(todayISO());
   const [contribAmount, setContribAmount] = useState("");
   const [contribBank, setContribBank] = useState("");
@@ -1320,8 +1879,12 @@ function GoalCard({ goal, expanded, onToggleExpand, onRemove, onAddContribution,
       <div className="period-head">
         <div className="period-range">
           <PiggyBank size={15} strokeWidth={1.8} />
-          <span>{goal.name}</span>
-          {goal.targetDate && <span className="tag tag-rumah">Target {fmtDate(goal.targetDate)}</span>}
+          <input
+            className="goal-name-input"
+            value={goal.name}
+            onChange={(e) => onUpdateField("name", e.target.value)}
+            placeholder="Nama tujuan"
+          />
         </div>
         <div className="period-actions">
           <span className="mini-val" style={{ fontSize: 15 }}>{pct}%</span>
@@ -1334,7 +1897,28 @@ function GoalCard({ goal, expanded, onToggleExpand, onRemove, onAddContribution,
       <div className="period-stats">
         <div>
           <span className="mini-label">Target</span>
-          <span className="mini-val">{rupiah(goal.target)}</span>
+          <div className="rp-input small">
+            <span>Rp</span>
+            <input value={goal.target || ""} onChange={(e) => onUpdateField("target", e.target.value.replace(/\D/g, ""))} placeholder="0" />
+          </div>
+        </div>
+        <div>
+          <span className="mini-label">Target tanggal</span>
+          <input
+            type="date"
+            className="goal-date-input"
+            value={goal.targetDate || ""}
+            onChange={(e) => onUpdateField("targetDate", e.target.value)}
+          />
+        </div>
+        <div>
+          <span className="mini-label">Priority</span>
+          <input
+            className="goal-priority-input"
+            value={goal.priority ?? ""}
+            onChange={(e) => onUpdateField("priority", e.target.value.replace(/\D/g, ""))}
+            placeholder="—"
+          />
         </div>
         <div>
           <span className="mini-label">Terkumpul</span>
@@ -1411,6 +1995,7 @@ function SavingsGoalsSection({ data, update }) {
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
   const [targetDate, setTargetDate] = useState("");
+  const [priority, setPriority] = useState("");
 
   const addGoal = () => {
     if (!name.trim() || !target) return;
@@ -1419,16 +2004,34 @@ function SavingsGoalsSection({ data, update }) {
       ...d,
       financial: {
         ...d.financial,
-        goals: [{ id, name: name.trim(), target: Number(target) || 0, targetDate, contributions: [] }, ...(d.financial.goals || [])],
+        goals: [
+          { id, name: name.trim(), target: Number(target) || 0, targetDate, priority: priority ? Number(priority) : null, contributions: [] },
+          ...(d.financial.goals || []),
+        ],
       },
     }));
     setExpanded((s) => new Set(s).add(id));
     setName("");
     setTarget("");
     setTargetDate("");
+    setPriority("");
   };
 
   const removeGoal = (id) => update((d) => ({ ...d, financial: { ...d.financial, goals: (d.financial.goals || []).filter((g) => g.id !== id) } }));
+
+  const updateGoalField = (id, field, value) =>
+    update((d) => ({
+      ...d,
+      financial: {
+        ...d.financial,
+        goals: (d.financial.goals || []).map((g) => {
+          if (g.id !== id) return g;
+          if (field === "target") return { ...g, target: Number(value) || 0 };
+          if (field === "priority") return { ...g, priority: value === "" ? null : Number(value) };
+          return { ...g, [field]: value };
+        }),
+      },
+    }));
 
   const toggleExpand = (id) =>
     setExpanded((s) => {
@@ -1462,7 +2065,17 @@ function SavingsGoalsSection({ data, update }) {
       },
     }));
 
-  const sorted = [...goals].sort((a, b) => (b.id > a.id ? 1 : -1));
+  // Goals with a priority set sort to the top, lowest number first; goals
+  // without a priority keep their original (most-recently-added-first) order
+  // and stay below all prioritized ones.
+  const sorted = [...goals].sort((a, b) => {
+    const pa = a.priority === null || a.priority === undefined || a.priority === "" ? null : Number(a.priority);
+    const pb = b.priority === null || b.priority === undefined || b.priority === "" ? null : Number(b.priority);
+    if (pa !== null && pb !== null) return pa - pb;
+    if (pa !== null) return -1;
+    if (pb !== null) return 1;
+    return b.id > a.id ? 1 : -1;
+  });
 
   return (
     <>
@@ -1478,6 +2091,14 @@ function SavingsGoalsSection({ data, update }) {
         </Field>
         <Field label="Target tanggal (opsional)">
           <input type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
+        </Field>
+        <Field label="Priority (opsional)">
+          <input
+            value={priority}
+            onChange={(e) => setPriority(e.target.value.replace(/\D/g, ""))}
+            placeholder="1, 2, 3…"
+            style={{ width: 90 }}
+          />
         </Field>
         <button type="button" className="btn-primary" onClick={addGoal} style={{ alignSelf: "flex-end" }}>
           <Plus size={16} /> Tambah Tujuan
@@ -1495,6 +2116,7 @@ function SavingsGoalsSection({ data, update }) {
               expanded={expanded.has(g.id)}
               onToggleExpand={() => toggleExpand(g.id)}
               onRemove={() => removeGoal(g.id)}
+              onUpdateField={(field, value) => updateGoalField(g.id, field, value)}
               onAddContribution={(date, amount, bank, tipe) => addContribution(g.id, date, amount, bank, tipe)}
               onRemoveContribution={(cid) => removeContribution(g.id, cid)}
             />
@@ -1505,17 +2127,35 @@ function SavingsGoalsSection({ data, update }) {
   );
 }
 
-function BudgetTab({ data, update, appSave }) {
+function FinancialTodoSection({ data, update, appSave }) {
+  return <TaskTableSection listKey="financialTodos" data={data} update={update} appSave={appSave} />;
+}
+
+function BudgetTab({ data, update, appSave, subTab, setSubTab }) {
   return (
     <div className="panel">
       <div className="panel-head">
         <h1>Financial</h1>
-        <p className="sub">Lacak progres tabungan dan investasi menuju tujuan keuangan keluarga.</p>
+        <p className="sub">Kelola to-do keuangan dan lacak progres tabungan menuju tujuan keuangan keluarga.</p>
       </div>
 
-      <PageSaveBar {...appSave} />
+      <div className="subtabs">
+        <button className={subTab === "todo" ? "active" : ""} onClick={() => setSubTab("todo")}>
+          To-Do
+        </button>
+        <button className={subTab === "plan" ? "active" : ""} onClick={() => setSubTab("plan")}>
+          Financial Plan
+        </button>
+      </div>
 
-      <SavingsGoalsSection data={data} update={update} />
+      {subTab === "todo" ? (
+        <FinancialTodoSection data={data} update={update} appSave={appSave} />
+      ) : (
+        <>
+          <PageSaveBar {...appSave} />
+          <SavingsGoalsSection data={data} update={update} />
+        </>
+      )}
     </div>
   );
 }
@@ -1607,7 +2247,23 @@ function UserManagementTab({ data, update, appSave, currentUsername }) {
   const users = data.users || [];
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [role, setRole] = useState("user");
   const [error, setError] = useState("");
+  const superAdminCount = users.filter((u) => roleOf(u) === "super_admin").length;
+
+  const changeRole = (id, newRole) => {
+    const target = users.find((u) => u.id === id);
+    if (target && target.username === currentUsername) {
+      setError("Tidak bisa mengubah role akun yang sedang login.");
+      return;
+    }
+    if (target && roleOf(target) === "super_admin" && newRole !== "super_admin" && superAdminCount <= 1) {
+      setError("Tidak bisa diubah — minimal harus ada 1 Super Admin.");
+      return;
+    }
+    update((d) => ({ ...d, users: (d.users || []).map((u) => (u.id === id ? { ...u, role: newRole } : u)) }));
+    setError("");
+  };
 
   const addUser = () => {
     if (!username.trim() || !password) return;
@@ -1615,7 +2271,7 @@ function UserManagementTab({ data, update, appSave, currentUsername }) {
       setError("Username sudah dipakai.");
       return;
     }
-    update((d) => ({ ...d, users: [...(d.users || []), { id: uid(), username: username.trim(), password }] }));
+    update((d) => ({ ...d, users: [...(d.users || []), { id: uid(), username: username.trim(), password, role }] }));
     setUsername("");
     setPassword("");
     setError("");
@@ -1624,6 +2280,11 @@ function UserManagementTab({ data, update, appSave, currentUsername }) {
   const removeUser = (id, uname) => {
     if (users.length <= 1) {
       setError("Tidak bisa hapus — minimal harus ada 1 user.");
+      return;
+    }
+    const target = users.find((u) => u.id === id);
+    if (target && roleOf(target) === "super_admin" && superAdminCount <= 1) {
+      setError("Tidak bisa hapus — minimal harus ada 1 Super Admin.");
       return;
     }
     if (uname === currentUsername) {
@@ -1646,6 +2307,13 @@ function UserManagementTab({ data, update, appSave, currentUsername }) {
       <div className="add-form wrap">
         <input placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} style={{ width: 160 }} />
         <input placeholder="Password" type="text" value={password} onChange={(e) => setPassword(e.target.value)} style={{ width: 160 }} />
+        <select value={role} onChange={(e) => setRole(e.target.value)}>
+          {ROLES.map((r) => (
+            <option key={r.value} value={r.value}>
+              {r.label}
+            </option>
+          ))}
+        </select>
         <button type="button" className="btn-primary" onClick={addUser}>
           <Plus size={16} /> Tambah User
         </button>
@@ -1662,6 +2330,13 @@ function UserManagementTab({ data, update, appSave, currentUsername }) {
                 <span className="list-title">{u.username}</span>
                 {u.username === currentUsername && <span className="tag tag-rumah">Sedang login</span>}
               </div>
+              <select value={roleOf(u)} onChange={(e) => changeRole(u.id, e.target.value)} style={{ fontSize: 12.5 }}>
+                {ROLES.map((r) => (
+                  <option key={r.value} value={r.value}>
+                    {r.label}
+                  </option>
+                ))}
+              </select>
               <button className="icon-btn" onClick={() => removeUser(u.id, u.username)}>
                 <Trash2 size={15} />
               </button>
@@ -1748,6 +2423,9 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const remoteVersionRef = useRef(null); // updated_at of the row this browser last loaded/saved
+  const stateRef = useRef({});
 
   // --- Auth (client-side only — good enough for a personal household app,
   // not real security since credentials live in the same local/Supabase store) ---
@@ -1762,6 +2440,7 @@ function App() {
 
   // --- Education Plan → Supabase (manual save only) ---
   const [eduSubTab, setEduSubTab] = useState("todo");
+  const [finSubTab, setFinSubTab] = useState("todo");
   const [savedEduSnapshot, setSavedEduSnapshot] = useState(null); // null until remote baseline is known
   const [eduPlanDirty, setEduPlanDirty] = useState(false);
   const [eduSaving, setEduSaving] = useState(false);
@@ -1769,6 +2448,10 @@ function App() {
   const [eduSaveError, setEduSaveError] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
   const [showLeaveModal, setShowLeaveModal] = useState(false);
+  const [incompleteModal, setIncompleteModal] = useState(null); // null | "save" | "nav"
+  const [showTaskErrors, setShowTaskErrors] = useState(false);
+  const incompleteIds = findIncompleteTasks(data, savedDataSnapshot);
+  const hasIncomplete = incompleteIds.size > 0;
   const isOnEduPlan = tab === "pendidikan" && eduSubTab === "plan";
 
   // Restore a login for this browser tab session (cleared on tab close).
@@ -1785,6 +2468,7 @@ function App() {
   }, [loading, data]);
 
   const handleLogin = (username) => {
+    setTab("dashboard");
     setAuthedUsername(username);
     try {
       sessionStorage.setItem("griya-authed-username", username);
@@ -1792,6 +2476,7 @@ function App() {
   };
 
   const handleLogout = () => {
+    setTab("dashboard");
     setAuthedUsername(null);
     try {
       sessionStorage.removeItem("griya-authed-username");
@@ -1808,68 +2493,57 @@ function App() {
     users: raw.users && raw.users.length ? raw.users : emptyData().users,
   });
 
-  const readLocal = async () => {
-    try {
-      if (typeof window !== "undefined" && window.storage && window.storage.get) {
-        try {
-          const res = await window.storage.get(STORAGE_KEY, false);
-          return res ? res.value : null;
-        } catch (e) {
-          return localStorage.getItem(STORAGE_KEY);
-        }
-      }
-      return localStorage.getItem(STORAGE_KEY);
-    } catch (e) {
-      return null;
+  const initialLoad = async () => {
+    setLoading(true);
+    setLoadError(false);
+    const r = await fetchHouseholdDataRemote();
+    if (!r.ok) {
+      // Never fall back to empty defaults — that would look like "lost data"
+      // and risk overwriting the real data on the next Save.
+      setLoadError(true);
+      setLoading(false);
+      return;
     }
-  };
-
-  const writeLocal = async (json) => {
-    try {
-      if (typeof window !== "undefined" && window.storage && window.storage.set) {
-        try {
-          await window.storage.set(STORAGE_KEY, json, false);
-          return;
-        } catch (e) {
-          /* fall through */
-        }
-      }
-      localStorage.setItem(STORAGE_KEY, json);
-    } catch (e) {}
+    const merged = mergeWithDefaults(r.data || {});
+    remoteVersionRef.current = r.updatedAt;
+    setData(merged);
+    setSavedDataSnapshot(JSON.stringify(merged));
+    setLoading(false);
   };
 
   useEffect(() => {
-    (async () => {
-      try {
-        // Prefer Supabase — the same data becomes visible from any device.
-        // Falls back to this browser's local copy when Supabase can't be
-        // reached (e.g. the claude.ai preview sandbox blocks fetch()).
-        const remote = await fetchHouseholdDataRemote();
-        if (remote) {
-          const merged = mergeWithDefaults(remote);
-          setData(merged);
-          setSavedDataSnapshot(JSON.stringify(merged));
-          return;
-        }
-        const raw = await readLocal();
-        if (raw) {
-          const merged = mergeWithDefaults(JSON.parse(raw));
-          setData(merged);
-          setSavedDataSnapshot(JSON.stringify(merged));
-        } else {
-          const fresh = emptyData();
-          setData(fresh);
-          setSavedDataSnapshot(JSON.stringify(fresh));
-        }
-      } catch (err) {
-        const fresh = emptyData();
-        setData(fresh);
-        setSavedDataSnapshot(JSON.stringify(fresh));
-      } finally {
-        setLoading(false);
-      }
-    })();
+    initialLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Pull in other users' changes whenever there's nothing unsaved locally.
+  const refreshFromServer = async () => {
+    const st = stateRef.current;
+    if (st.busy || st.dirty) return;
+    const r = await fetchHouseholdDataRemote();
+    if (!r.ok || !r.data) return;
+    if (r.updatedAt === remoteVersionRef.current) return;
+    const st2 = stateRef.current;
+    if (st2.busy || st2.dirty) return;
+    const merged = mergeWithDefaults(r.data);
+    remoteVersionRef.current = r.updatedAt;
+    setData(merged);
+    setSavedDataSnapshot(JSON.stringify(merged));
+  };
+
+  useEffect(() => {
+    if (loading || loadError) return;
+    const tick = () => { if (document.visibilityState !== "hidden") refreshFromServer(); };
+    const iv = setInterval(tick, 20000);
+    window.addEventListener("focus", tick);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener("focus", tick);
+      document.removeEventListener("visibilitychange", tick);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, loadError]);
 
   const update = (fn) => {
     setData((prev) => {
@@ -1886,16 +2560,27 @@ function App() {
 
   const saveApp = async () => {
     if (!data) return false;
+    if (hasIncomplete) {
+      setShowTaskErrors(true);
+      setIncompleteModal("save");
+      return false;
+    }
     setAppSaving(true);
     setAppSaveError(false);
     try {
-      const json = JSON.stringify(data);
-      // Best-effort central sync — never blocks the save on Supabase being
-      // reachable; the local copy below always succeeds so Save never fails
-      // from the user's point of view even fully offline.
-      await saveHouseholdDataRemote(data);
-      await writeLocal(json);
-      setSavedDataSnapshot(json);
+      let toSave = data;
+      // Someone else may have saved since we loaded — merge instead of overwriting.
+      const r = await fetchHouseholdDataRemote();
+      if (!r.ok) throw new Error("Supabase unreachable");
+      if (r.data && r.updatedAt !== remoteVersionRef.current) {
+        const base = savedDataSnapshot ? JSON.parse(savedDataSnapshot) : {};
+        toSave = mergeWithDefaults(mergeThreeWay(base, data, mergeWithDefaults(r.data)));
+      }
+      const savedAt = await saveHouseholdDataRemote(toSave);
+      if (!savedAt) throw new Error("Supabase save failed");
+      remoteVersionRef.current = savedAt;
+      setSavedDataSnapshot(JSON.stringify(toSave));
+      if (toSave !== data) setData(toSave);
       setAppDirty(false);
       setAppSavedAt(new Date());
       return true;
@@ -1909,6 +2594,7 @@ function App() {
 
   // Bundled for PageSaveBar — every page's Save button drives this same
   // underlying save (there's one shared store), just triggered per-page.
+  stateRef.current = { busy: appSaving || eduSaving || showLeaveModal || !!incompleteModal, dirty: appDirty || eduPlanDirty };
   const appSave = { dirty: appDirty, saving: appSaving, savedAt: appSavedAt, error: appSaveError, onSave: saveApp };
 
   // Once local data has loaded, fetch the last-saved Education Plan snapshot
@@ -1962,7 +2648,24 @@ function App() {
     }
   };
 
+  const currentUser = data ? (data.users || []).find((u) => u.username === authedUsername) : null;
+  const allowedTabs = ROLE_TABS[roleOf(currentUser)];
+  const canAccess = (key) => allowedTabs.includes(key);
+  useEffect(() => {
+    if (authedUsername && data && !canAccess(tab)) setTab("dashboard");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authedUsername, data, tab]);
+  const visibleNavTop = NAV_TOP.filter((n) => canAccess(n.key));
+  const visibleNavGroup = NAV_GROUP.items.filter((n) => canAccess(n.key));
+  const visibleNavSettings = NAV_SETTINGS_GROUP.items.filter((n) => canAccess(n.key));
+
   const guardedNavigate = (actionFn) => {
+    if (hasIncomplete) {
+      setShowTaskErrors(true);
+      setPendingAction(() => actionFn);
+      setIncompleteModal("nav");
+      return;
+    }
     if (appDirty || (isOnEduPlan && eduPlanDirty)) {
       setPendingAction(() => actionFn);
       setShowLeaveModal(true);
@@ -1984,6 +2687,8 @@ function App() {
     }
     if (reverted !== data) setData(reverted);
     setShowLeaveModal(false);
+    setIncompleteModal(null);
+    setShowTaskErrors(false);
     if (pendingAction) pendingAction();
     setPendingAction(null);
   };
@@ -2015,7 +2720,12 @@ function App() {
     return () => window.removeEventListener("beforeunload", handler);
   }, [eduPlanDirty, appDirty]);
 
+  useEffect(() => {
+    if (!hasIncomplete) setShowTaskErrors(false);
+  }, [hasIncomplete]);
+
   return (
+    <TaskValidationContext.Provider value={{ show: showTaskErrors, ids: incompleteIds }}>
     <div className="app-root">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap');
@@ -2142,13 +2852,13 @@ function App() {
         .login-btn{width:100%;justify-content:center;padding:11px 12px;margin-top:6px;}
 
         /* Main */
-        .main{flex:1;min-width:0;padding:34px 40px 60px;max-width:980px;}
+        .main{flex:1;min-width:0;padding:34px 40px 60px;max-width:1090px;}
         .panel-head{margin-bottom:22px;}
         .panel-head h1{font-size:26px;}
         .sub{color:var(--ink-soft);font-size:13.5px;margin:5px 0 0;}
 
         /* Stat grid (dashboard) */
-        .stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:24px;}
+        .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px;}
         .stat-card{
           background:var(--card);
           border:1px solid var(--line);
@@ -2227,6 +2937,28 @@ function App() {
         .subtabs{display:flex;gap:4px;margin-bottom:18px;border-bottom:1px solid var(--line);}
         .subtabs button{background:none;border:none;padding:9px 4px;margin-right:20px;font-size:13.5px;font-weight:600;color:var(--ink-soft);cursor:pointer;border-bottom:2px solid transparent;}
         .subtabs button.active{color:var(--ink);border-color:var(--pine);}
+        .task-table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card);}
+        .task-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;}
+        .task-table th{text-align:left;font-size:11.5px;font-weight:700;color:var(--ink-soft);padding:10px 10px;border-bottom:1px solid var(--line);background:rgba(0,0,0,0.02);}
+        .task-table td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle;}
+        .task-table tbody tr:last-child td{border-bottom:none;}
+        .task-table input,.task-table select{width:100%;font-family:'Inter',sans-serif;font-size:13px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
+        .task-table input:focus,.task-table select:focus{outline:2px solid var(--pine);outline-offset:1px;}
+        .task-no{text-align:center;color:var(--ink-soft);font-weight:600;}
+        .task-empty{text-align:center;color:var(--ink-soft);padding:22px 10px !important;}
+        .th-inner{display:flex;align-items:center;justify-content:space-between;gap:6px;}
+        .th-actions{display:inline-flex;gap:2px;}
+        .th-btn{background:none;border:none;padding:3px;border-radius:5px;color:var(--ink-soft);cursor:pointer;display:inline-flex;align-items:center;opacity:.65;}
+        .th-btn:hover{background:var(--track);opacity:1;}
+        .th-btn.on{color:var(--pine);opacity:1;background:var(--pine-tint);}
+        .th-pop{position:fixed;z-index:60;background:var(--card);border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 24px rgba(42,36,25,.16);padding:10px;width:224px;display:flex;flex-direction:column;gap:8px;font-weight:500;}
+        .th-pop input,.th-pop select{width:100%;font-family:'Inter',sans-serif;font-size:13px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
+        .th-pop-col{display:flex;flex-direction:column;gap:8px;}
+        .th-pop-col label{display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--ink-soft);}
+        .th-pop-col label.th-check{flex-direction:row;align-items:center;gap:8px;font-size:13px;font-weight:600;}
+        .th-pop-col label.th-check input{width:auto;}
+        .th-reset{align-self:flex-end;background:none;border:none;color:var(--pine);font-size:12px;font-weight:600;cursor:pointer;padding:2px 4px;}
+        .task-table input.cell-err,.task-table select.cell-err{border-color:var(--rate-b);background:#FBEAE7;}
 
         .save-bar{
           display:flex;align-items:center;justify-content:space-between;gap:12px;
@@ -2258,6 +2990,34 @@ function App() {
         .tag-kesehatan{background:var(--clay-tint);color:var(--clay);}
         .tag-pendidikan{background:var(--pine-tint);color:var(--pine);}
         .tag-lainnya{background:var(--track);color:var(--ink-soft);}
+        .tag-payroll{background:var(--sage-tint);color:var(--sage-dark);}
+        .tag-health{background:var(--clay-tint);color:var(--clay);}
+        .tag-education{background:var(--pine-tint);color:var(--pine);}
+        .tag-financial{background:var(--mustard-tint);color:#8A6316;}
+                .fp-card{cursor:pointer;margin-bottom:18px;}
+        .fp-card:hover{border-color:var(--pine);}
+        .fp-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px;}
+        .fp-head h2{margin-bottom:4px;}
+        .fp-sub{margin:0;font-size:12.5px;color:var(--ink-soft);}
+        .fp-link{font-size:12px;font-weight:600;color:var(--pine);white-space:nowrap;}
+        .fp-body{display:grid;grid-template-columns:220px 1fr;gap:28px;align-items:center;}
+        .fp-donut{position:relative;width:220px;height:220px;}
+        .fp-donut svg{width:100%;height:100%;transform:rotate(0deg);}
+        .fp-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;}
+        .fp-pct{font-family:'Fraunces',serif;font-size:32px;font-weight:600;line-height:1;color:var(--ink);}
+        .fp-pct-label{font-size:12px;color:var(--ink-soft);margin-top:4px;}
+        .fp-legend{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:14px;}
+        .fp-legend li{transition:opacity .15s;}
+        .fp-legend li.dim{opacity:.4;}
+        .fp-row-top{display:flex;align-items:center;gap:8px;}
+        .fp-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+        .fp-name{font-size:13.5px;font-weight:600;color:var(--ink);}
+        .fp-prio{font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:20px;background:var(--mustard-tint);color:#8A6316;}
+        .fp-gpct{margin-left:auto;font-size:13px;font-weight:700;}
+        .fp-bar{height:6px;border-radius:6px;background:var(--track);overflow:hidden;margin:6px 0 4px;}
+        .fp-bar div{height:100%;border-radius:6px;transition:width .9s cubic-bezier(.2,.8,.2,1);}
+        .fp-row-sub{font-size:11.5px;color:var(--ink-soft);}
+        .stat-lines{display:flex;flex-direction:column;gap:2px;font-size:11.5px;color:var(--ink-soft);min-height:32px;}
         .tag-status-hadir{background:var(--sage-tint);color:var(--sage-dark);}
         .tag-status-izin{background:var(--mustard-tint);color:#8A6316;}
         .tag-status-sakit{background:var(--clay-tint);color:var(--clay);}
@@ -2294,6 +3054,16 @@ function App() {
         .period-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;}
         .period-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}
         .period-range{display:flex;align-items:center;gap:8px;font-family:'Fraunces',serif;font-size:15px;font-weight:600;color:var(--ink);}
+        .goal-name-input{
+          font-family:'Fraunces',serif;font-size:15px;font-weight:600;color:var(--ink);
+          border:1px solid transparent;background:transparent;padding:3px 6px;border-radius:6px;min-width:140px;
+        }
+        .goal-name-input:hover,.goal-name-input:focus{border-color:var(--line);background:#fff;outline:none;}
+        .goal-date-input,.goal-priority-input{
+          padding:6px 8px;border:1px solid var(--line);border-radius:6px;
+          font-size:13px;font-family:'Inter',sans-serif;background:#fff;
+        }
+        .goal-priority-input{width:60px;text-align:center;}
         .period-actions{display:flex;align-items:center;gap:10px;}
         .period-status-row{margin:12px 0;}
         .paid-toggle{
@@ -2404,12 +3174,22 @@ function App() {
           .nav-item-child{padding-left:20px;}
           .main{padding:20px;}
           .stat-grid{grid-template-columns:1fr 1fr;}
+          .fp-body{grid-template-columns:1fr;justify-items:center;}
+          .fp-legend{width:100%;}
           .dash-lower{grid-template-columns:1fr;}
           .budget-table-row{grid-template-columns:1fr;}
         }
       `}</style>
 
-      {loading ? (
+      {loadError ? (
+        <div className="app-loading">
+          <AlertCircle size={22} />
+          <p style={{ marginTop: 10, fontSize: 13, maxWidth: 320, textAlign: "center" }}>
+            Tidak bisa terhubung ke database. Periksa koneksi internet, lalu coba lagi. (Database gratis Supabase bisa tertidur setelah lama tidak dipakai — butuh ±1 menit untuk aktif kembali.)
+          </p>
+          <button className="btn-primary" style={{ marginTop: 12 }} onClick={initialLoad}>Coba lagi</button>
+        </div>
+      ) : loading ? (
         <div className="app-loading">
           <Loader2 size={22} className="spin" />
           <p style={{ marginTop: 10, fontSize: 13 }}>Memuat data…</p>
@@ -2422,7 +3202,7 @@ function App() {
         <div className="brand">
           Griya<span>Household Planner</span>
         </div>
-        {NAV_TOP.map((n) => (
+        {visibleNavTop.map((n) => (
           <button
             key={n.key}
             className={"nav-item" + (tab === n.key ? " active" : "")}
@@ -2438,7 +3218,7 @@ function App() {
           {categoryOpen ? <ChevronDown size={14} strokeWidth={2} /> : <ChevronRight size={14} strokeWidth={2} />}
         </button>
         {categoryOpen &&
-          NAV_GROUP.items.map((n) => (
+          visibleNavGroup.map((n) => (
             <button
               key={n.key}
               className={"nav-item nav-item-child" + (tab === n.key ? " active" : "")}
@@ -2449,12 +3229,14 @@ function App() {
             </button>
           ))}
 
+        {visibleNavSettings.length > 0 && (
         <button className="nav-group-header" onClick={() => setSettingsOpen((o) => !o)}>
           <span>{NAV_SETTINGS_GROUP.label}</span>
           {settingsOpen ? <ChevronDown size={14} strokeWidth={2} /> : <ChevronRight size={14} strokeWidth={2} />}
         </button>
-        {settingsOpen &&
-          NAV_SETTINGS_GROUP.items.map((n) => (
+        )}
+        {settingsOpen && visibleNavSettings.length > 0 &&
+          visibleNavSettings.map((n) => (
             <button
               key={n.key}
               className={"nav-item nav-item-child" + (tab === n.key ? " active" : "")}
@@ -2482,11 +3264,11 @@ function App() {
           </div>
         ) : (
           <>
-            {tab === "dashboard" && <Dashboard data={data} setTab={(t) => guardedNavigate(() => setTab(t))} />}
-            {tab === "todo" && <TodoTab data={data} update={update} appSave={appSave} />}
-            {tab === "nanny" && <NannyTab data={data} update={update} appSave={appSave} />}
-            {tab === "kesehatan" && <KesehatanTab data={data} update={update} appSave={appSave} />}
-            {tab === "pendidikan" && (
+            {tab === "dashboard" && canAccess("dashboard") && <Dashboard data={data} setTab={(t) => guardedNavigate(() => setTab(t))} openFinancialPlan={() => guardedNavigate(() => { setFinSubTab("plan"); setTab("budget"); })} />}
+            {tab === "todo" && canAccess("todo") && <TodoTab data={data} update={update} appSave={appSave} />}
+            {tab === "nanny" && canAccess("nanny") && <NannyTab data={data} update={update} appSave={appSave} />}
+            {tab === "kesehatan" && canAccess("kesehatan") && <KesehatanTab data={data} update={update} appSave={appSave} />}
+            {tab === "pendidikan" && canAccess("pendidikan") && (
               <PendidikanTab
                 data={data}
                 update={update}
@@ -2500,14 +3282,36 @@ function App() {
                 appSave={appSave}
               />
             )}
-            {tab === "budget" && <BudgetTab data={data} update={update} appSave={appSave} />}
-            {tab === "masterdata" && <MasterDataTab data={data} update={update} appSave={appSave} />}
-            {tab === "usermanagement" && (
+            {tab === "budget" && canAccess("budget") && <BudgetTab data={data} update={update} appSave={appSave} subTab={finSubTab} setSubTab={setFinSubTab} />}
+            {tab === "masterdata" && canAccess("masterdata") && <MasterDataTab data={data} update={update} appSave={appSave} />}
+            {tab === "usermanagement" && canAccess("usermanagement") && (
               <UserManagementTab data={data} update={update} appSave={appSave} currentUsername={authedUsername} />
             )}
           </>
         )}
       </main>
+
+      {incompleteModal && (
+        <div className="modal-overlay" onClick={() => { setIncompleteModal(null); setPendingAction(null); }}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h2>Data Belum Lengkap</h2>
+            <p className="modal-text">
+              Ada baris di tabel To-Do yang masih memiliki kolom kosong (Task, PIC, atau Due Date). Lengkapi data terlebih dahulu
+              {incompleteModal === "save" ? " sebelum menyimpan." : " sebelum pindah halaman."}
+            </p>
+            <div className="modal-actions">
+              {incompleteModal === "nav" && (
+                <button className="btn-secondary" onClick={handleContinueWithoutSaving}>
+                  Continue without saving
+                </button>
+              )}
+              <button className="btn-primary" onClick={() => { setIncompleteModal(null); setPendingAction(null); }}>
+                Edit Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showLeaveModal && (
         <div className="modal-overlay" onClick={() => setShowLeaveModal(false)}>
@@ -2532,6 +3336,7 @@ function App() {
 
       <style>{`.spin{animation:spin 1s linear infinite;} @keyframes spin{to{transform:rotate(360deg);}}`}</style>
     </div>
+    </TaskValidationContext.Provider>
   );
 }
 
