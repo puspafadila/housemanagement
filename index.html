@@ -319,7 +319,11 @@ const emptyData = () => ({
   educationTodos: [],
   financialTodos: [],
   careerTodos: [],
+  careerParents: [],
+  careerTodos2: [],
+  careerParents2: [],
   careerPlan: [],
+  careerPlan2: [],
   businessTodos: [],
   businessPlan: [],
   budget: {
@@ -655,9 +659,15 @@ function FinancialPlanSummary({ goals, onOpen }) {
 const TASK_SOURCES = [
   ["Education", "educationTodos"],
   ["Financial", "financialTodos"],
-  ["Career", "careerTodos"],
+  ["Career Plan 1", "careerTodos"],
+  ["Career Plan 2", "careerTodos2"],
   ["Business", "businessTodos"],
 ];
+// Plan tables (Career Plan 1/2, Business Plan) also have PIC + status; map their statuses onto the task ones.
+const PLAN_SOURCES = [
+  ["Business Plan", "businessPlan"],
+];
+const PLAN_TO_TASK_STATUS = { "Not Started": "Open", "In Progress": "In Progress", "On Hold": "Hold" };
 
 function TasksByPicSummary({ data }) {
   const [ready, setReady] = useState(false);
@@ -667,16 +677,31 @@ function TasksByPicSummary({ data }) {
   }, []);
   const today = todayISO();
   const map = {};
-  TASK_SOURCES.forEach(([label, key]) => {
-    (data[key] || []).map(normalizeTask).forEach((t) => {
-      if (t.status === "Complete" || t.status === "Cancelled") return;
+  const items = [];
+  TASK_SOURCES.forEach(([label, key]) => (data[key] || []).map(normalizeTask).forEach((t) => items.push([label, t])));
+  PLAN_SOURCES.forEach(([label, key]) =>
+    (data[key] || []).forEach((r) => {
+      const status = PLAN_TO_TASK_STATUS[r.status];
+      if (status) items.push([label, { pic: r.pic, dueDate: r.targetDate, status }]);
+    })
+  );
+  // Financial Plan goals also have a PIC: unfinished goals count as outstanding (no progress = Open, some progress = In Progress).
+  ((data.financial && data.financial.goals) || []).forEach((g) => {
+    const target = Number(g.target) || 0;
+    const saved = goalSaved(g);
+    if (target > 0 && saved >= target) return;
+    items.push(["Financial Plan", { pic: g.pic, dueDate: g.targetDate, status: saved > 0 ? "In Progress" : "Open" }]);
+  });
+  items.forEach(([label, t]) => {
+    if (t.status === "Complete" || t.status === "Cancelled") return;
+    {
       const pic = t.pic || "(tanpa PIC)";
       const e = (map[pic] = map[pic] || { pic, Open: 0, "In Progress": 0, Hold: 0, total: 0, overdue: 0, by: {} });
       e[t.status] = (e[t.status] || 0) + 1;
       e.total += 1;
       if (t.dueDate && t.dueDate < today) e.overdue += 1;
       e.by[label] = (e.by[label] || 0) + 1;
-    });
+    }
   });
   const rows = Object.values(map).sort((a, b) => b.total - a.total || a.pic.localeCompare(b.pic));
   const max = Math.max(1, ...rows.map((r) => r.total));
@@ -693,7 +718,7 @@ function TasksByPicSummary({ data }) {
         <div>
           <h2>Task yang Perlu Diselesaikan per PIC</h2>
           <p className="fp-sub">
-            {totalAll} task belum selesai · Education, Financial, Career, Business
+            {totalAll} task belum selesai · To-Do, Plan, dan tujuan Financial Plan
           </p>
         </div>
         <div className="tp-legend">
@@ -1510,6 +1535,8 @@ const normalizeTask = (t) => ({
   pic: t.pic || "",
   dueDate: t.dueDate !== undefined ? t.dueDate : t.targetDate || "",
   status: TASK_STATUSES.includes(t.status) ? t.status : t.status === "Selesai" ? "Complete" : "Open",
+  parentId: t.parentId || "",
+  nominal: t.nominal === undefined || t.nominal === null ? "" : String(t.nominal),
 });
 
 const TASK_STATUS_COLORS = {
@@ -1533,10 +1560,10 @@ const findIncompleteTasks = (data, savedJSON) => {
   try {
     saved = savedJSON ? JSON.parse(savedJSON) : {};
   } catch (e) {}
-  ["educationTodos", "financialTodos", "careerTodos", "businessTodos"].forEach((key) => {
+  ["educationTodos", "financialTodos", "careerTodos", "careerTodos2", "businessTodos"].forEach((key) => {
     const before = new Map(((saved && saved[key]) || []).map(normalizeTask).map((r) => [r.id, JSON.stringify(r)]));
     ((data && data[key]) || []).map(normalizeTask).forEach((r) => {
-      if (isTaskRowIncomplete(r) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
+      if ((isTaskRowIncomplete(r) || (key.startsWith("careerTodos") && !r.parentId)) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
     });
   });
   return ids;
@@ -1611,9 +1638,9 @@ function ColumnHeader({ label, width, sortDir, onSort, filterActive, filterConte
   );
 }
 
-const EMPTY_TASK_FILTERS = { task: "", pic: "", dueFrom: "", dueTo: "", status: [] };
+const EMPTY_TASK_FILTERS = { task: "", parent: "", pic: "", dueFrom: "", dueTo: "", status: [] };
 
-function TaskTableSection({ listKey, data, update, appSave }) {
+function TaskTableSection({ listKey, data, update, appSave, parents, hideSaveBar, showNominal }) {
   const validation = React.useContext(TaskValidationContext);
   const rows = (data[listKey] || []).map(normalizeTask);
   const users = data.users || [];
@@ -1626,6 +1653,7 @@ function TaskTableSection({ listKey, data, update, appSave }) {
   const setRows = (fn) => update((d) => ({ ...d, [listKey]: fn((d[listKey] || []).map(normalizeTask)) }));
   const filtersActive = {
     task: !!filters.task.trim(),
+    parent: !!filters.parent,
     pic: !!filters.pic,
     dueDate: !!(filters.dueFrom || filters.dueTo),
     status: filters.status.length > 0,
@@ -1634,7 +1662,7 @@ function TaskTableSection({ listKey, data, update, appSave }) {
 
   const addRow = () => {
     setFilters(EMPTY_TASK_FILTERS); // so the new (empty) row is never hidden by a filter
-    setRows((list) => [...list, { id: uid(), task: "", pic: "", dueDate: "", status: "Open" }]);
+    setRows((list) => [...list, { id: uid(), task: "", pic: "", dueDate: "", status: "Open", parentId: "", nominal: "" }]);
   };
   const editRow = (id, field, value) => setRows((list) => list.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
   const removeRow = (id) => setRows((list) => list.filter((r) => r.id !== id));
@@ -1646,6 +1674,7 @@ function TaskTableSection({ listKey, data, update, appSave }) {
   let view = rows.map((r, i) => ({ ...r, _i: i }));
   view = view.filter((r) => {
     if (filtersActive.task && !r.task.toLowerCase().includes(filters.task.trim().toLowerCase())) return false;
+    if (filtersActive.parent && (filters.parent === "__blank__" ? r.parentId : r.parentId !== filters.parent)) return false;
     if (filtersActive.pic && (filters.pic === "__blank__" ? r.pic : r.pic !== filters.pic)) return false;
     if (filters.dueFrom && (!r.dueDate || r.dueDate < filters.dueFrom)) return false;
     if (filters.dueTo && (!r.dueDate || r.dueDate > filters.dueTo)) return false;
@@ -1653,7 +1682,8 @@ function TaskTableSection({ listKey, data, update, appSave }) {
     return true;
   });
   if (sort.key) {
-    const val = (r) => (sort.key === "no" ? r._i : sort.key === "status" ? TASK_STATUSES.indexOf(r.status) : (r[sort.key] || "").toString().toLowerCase());
+    const parentPos = (r) => { const i = (parents || []).findIndex((p) => p.id === r.parentId); return i < 0 ? "" : i; };
+    const val = (r) => (sort.key === "no" ? r._i : sort.key === "parent" ? parentPos(r) : sort.key === "nominal" ? (r.nominal === "" ? "" : Number(r.nominal)) : sort.key === "status" ? TASK_STATUSES.indexOf(r.status) : (r[sort.key] || "").toString().toLowerCase());
     const dir = sort.dir === "asc" ? 1 : -1;
     view.sort((a, b) => {
       const va = val(a), vb = val(b);
@@ -1668,13 +1698,34 @@ function TaskTableSection({ listKey, data, update, appSave }) {
 
   return (
     <>
-      <PageSaveBar {...appSave} />
+      {!hideSaveBar && <PageSaveBar {...appSave} />}
 
       <div className="task-table-wrap">
         <table className="task-table">
           <thead>
             <tr>
               <ColumnHeader label="No" width={58} sortDir={dirOf("no")} onSort={() => cycleSort("no")} />
+              {parents && (
+                <ColumnHeader
+                  label="Induk Task"
+                  width={170}
+                  sortDir={dirOf("parent")}
+                  onSort={() => cycleSort("parent")}
+                  filterActive={filtersActive.parent}
+                  onResetFilter={() => setFilter({ parent: "" })}
+                  filterContent={
+                    <select value={filters.parent} onChange={(e) => setFilter({ parent: e.target.value })}>
+                      <option value="">Semua</option>
+                      <option value="__blank__">(Kosong)</option>
+                      {parents.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.order}. {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  }
+                />
+              )}
               <ColumnHeader
                 label="Task"
                 sortDir={dirOf("task")}
@@ -1685,6 +1736,7 @@ function TaskTableSection({ listKey, data, update, appSave }) {
                   <input autoFocus placeholder="Cari task…" value={filters.task} onChange={(e) => setFilter({ task: e.target.value })} />
                 }
               />
+              {showNominal && <ColumnHeader label="Nominal" width={150} sortDir={dirOf("nominal")} onSort={() => cycleSort("nominal")} />}
               <ColumnHeader
                 label="PIC"
                 width={172}
@@ -1752,7 +1804,7 @@ function TaskTableSection({ listKey, data, update, appSave }) {
           <tbody>
             {view.length === 0 && (
               <tr>
-                <td colSpan={6} className="task-empty">
+                <td colSpan={6 + (parents ? 1 : 0) + (showNominal ? 1 : 0)} className="task-empty">
                   {rows.length === 0 ? 'Belum ada task. Klik "Tambah Baris" untuk menambahkan.' : "Tidak ada baris yang cocok dengan filter."}
                 </td>
               </tr>
@@ -1762,6 +1814,18 @@ function TaskTableSection({ listKey, data, update, appSave }) {
               return (
                 <tr key={r.id}>
                   <td className="task-no">{i + 1}</td>
+                  {parents && (
+                    <td>
+                      <select className={cellErr(r, !r.parentId) ? "cell-err" : ""} value={r.parentId} onChange={(e) => editRow(r.id, "parentId", e.target.value)}>
+                        <option value="">— pilih induk —</option>
+                        {parents.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.order}. {p.name || "(tanpa nama)"}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                  )}
                   <td>
                     <input
                       className={cellErr(r, !r.task.trim()) ? "cell-err" : ""}
@@ -1770,6 +1834,19 @@ function TaskTableSection({ listKey, data, update, appSave }) {
                       onChange={(e) => editRow(r.id, "task", e.target.value)}
                     />
                   </td>
+                  {showNominal && (
+                    <td>
+                      <div className="rp-input small">
+                        <span>Rp</span>
+                        <input
+                          inputMode="numeric"
+                          placeholder="0"
+                          value={r.nominal}
+                          onChange={(e) => editRow(r.id, "nominal", e.target.value.replace(/\D/g, ""))}
+                        />
+                      </div>
+                    </td>
+                  )}
                   <td>
                     <select className={cellErr(r, !r.pic) ? "cell-err" : ""} value={r.pic} onChange={(e) => editRow(r.id, "pic", e.target.value)}>
                       <option value="">— pilih PIC —</option>
@@ -2271,7 +2348,7 @@ function SavingsGoalsSection({ data, update }) {
 }
 
 function FinancialTodoSection({ data, update, appSave }) {
-  return <TaskTableSection listKey="financialTodos" data={data} update={update} appSave={appSave} />;
+  return <TaskTableSection listKey="financialTodos" data={data} update={update} appSave={appSave} showNominal />;
 }
 
 /* ---------------------------------------------------------
@@ -2286,10 +2363,12 @@ const PLAN_STATUS_COLORS = {
   Cancelled: "#8a8a8a",
 };
 
-function PlanTableSection({ listKey, data, update, appSave, planWord, placeholder }) {
+function PlanTableSection({ listKey, data, update, appSave, planWord, placeholder, showPic }) {
+  const users = data.users || [];
+  const cols = showPic ? 7 : 6;
   const rows = data[listKey] || [];
   const setRows = (fn) => update((d) => ({ ...d, [listKey]: fn(d[listKey] || []) }));
-  const addRow = () => setRows((list) => [...list, { id: uid(), plan: "", detail: "", targetDate: "", status: "Not Started" }]);
+  const addRow = () => setRows((list) => [...list, { id: uid(), plan: "", detail: "", pic: "", targetDate: "", status: "Not Started" }]);
   const editRow = (id, field, value) => setRows((list) => list.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
   const removeRow = (id) => setRows((list) => list.filter((r) => r.id !== id));
 
@@ -2304,6 +2383,7 @@ function PlanTableSection({ listKey, data, update, appSave, planWord, placeholde
               <th style={{ width: 58 }}>No</th>
               <th>{planWord}</th>
               <th>Detail</th>
+              {showPic && <th style={{ width: 160 }}>PIC</th>}
               <th style={{ width: 150 }}>Target Date</th>
               <th style={{ width: 150 }}>Status</th>
               <th style={{ width: 36 }}></th>
@@ -2312,7 +2392,7 @@ function PlanTableSection({ listKey, data, update, appSave, planWord, placeholde
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={6} className="task-empty">
+                <td colSpan={cols} className="task-empty">
                   Belum ada rencana. Klik "Tambah Baris" untuk menambahkan.
                 </td>
               </tr>
@@ -2328,6 +2408,11 @@ function PlanTableSection({ listKey, data, update, appSave, planWord, placeholde
                   <td>
                     <input value={r.detail} placeholder="Detail / langkah…" onChange={(e) => editRow(r.id, "detail", e.target.value)} />
                   </td>
+                  {showPic && (
+                    <td>
+                      <PicSelect value={r.pic} onChange={(v) => editRow(r.id, "pic", v)} users={users} />
+                    </td>
+                  )}
                   <td>
                     <input type="date" value={r.targetDate} onChange={(e) => editRow(r.id, "targetDate", e.target.value)} />
                   </td>
@@ -2362,7 +2447,7 @@ function PlanTableSection({ listKey, data, update, appSave, planWord, placeholde
   );
 }
 
-function PlanModuleTab({ data, update, appSave, title, sub, planLabel, planWord, placeholder, todoKey, planKey }) {
+function PlanModuleTab({ data, update, appSave, title, sub, plans, planWord, placeholder, todoKey, showPic, TodoComponent }) {
   const [subTab, setSubTab] = useState("todo");
   return (
     <div className="panel">
@@ -2375,34 +2460,212 @@ function PlanModuleTab({ data, update, appSave, title, sub, planLabel, planWord,
         <button className={subTab === "todo" ? "active" : ""} onClick={() => setSubTab("todo")}>
           To-Do
         </button>
-        <button className={subTab === "plan" ? "active" : ""} onClick={() => setSubTab("plan")}>
-          {planLabel}
-        </button>
+        {plans.map((p) => (
+          <button key={p.key} className={subTab === p.key ? "active" : ""} onClick={() => setSubTab(p.key)}>
+            {p.label}
+          </button>
+        ))}
       </div>
 
       {subTab === "todo" ? (
-        <TaskTableSection listKey={todoKey} data={data} update={update} appSave={appSave} />
+        TodoComponent ? (
+          <TodoComponent data={data} update={update} appSave={appSave} />
+        ) : (
+          <TaskTableSection listKey={todoKey} data={data} update={update} appSave={appSave} />
+        )
       ) : (
-        <PlanTableSection listKey={planKey} data={data} update={update} appSave={appSave} planWord={planWord} placeholder={placeholder} />
+        <PlanTableSection
+          key={subTab}
+          listKey={(plans.find((p) => p.key === subTab) || plans[0]).listKey}
+          data={data}
+          update={update}
+          appSave={appSave}
+          planWord={planWord}
+          placeholder={placeholder}
+          showPic={showPic}
+        />
       )}
     </div>
   );
 }
 
-function CareerTab({ data, update, appSave }) {
+/* ---------------------------------------------------------
+   Career To-Do: parent tasks (induk task) + career staircase
+--------------------------------------------------------- */
+const parentOrderVal = (p) => (p.order === "" || p.order === null || p.order === undefined || isNaN(Number(p.order)) ? Infinity : Number(p.order));
+const sortParents = (list) =>
+  [...list].sort((a, b) => {
+    const x = parentOrderVal(a), y = parentOrderVal(b);
+    return x === y ? (a.name || "").localeCompare(b.name || "") : x < y ? -1 : 1;
+  });
+
+// Staircase colours per parent-task status (Complete = done step, In Progress = current step, …).
+const STEP_STYLE = {
+  Complete: { bg: "#1e8449", fg: "#fff" },
+  "In Progress": { bg: "#d9822b", fg: "#fff" },
+  Hold: { bg: "#ecc489", fg: "#4a3410" },
+  Open: { bg: "#e4dccb", fg: "#3b3326" },
+  Cancelled: { bg: "#c9c9c9", fg: "#555" },
+};
+
+function CareerStairs({ data, todosKey, parentsKey }) {
+  const parents = sortParents(data[parentsKey] || []);
+  const todos = (data[todosKey] || []).map(normalizeTask);
   return (
-    <PlanModuleTab
-      data={data}
-      update={update}
-      appSave={appSave}
-      title="Career"
-      sub="Kelola to-do karier dan rencana pengembangan karier jangka panjang."
-      planLabel="Career Plan"
-      planWord="Plan"
-      placeholder="mis. Naik ke posisi senior…"
-      todoKey="careerTodos"
-      planKey="careerPlan"
-    />
+    <div className="card stairs-card">
+      <div className="fp-head">
+        <div>
+          <h2>Tangga Career Plan</h2>
+          <p className="fp-sub">Berdasarkan Induk Task, diurutkan dari nomor urutan terkecil (anak tangga paling bawah).</p>
+        </div>
+        <div className="tp-legend">
+          {["Complete", "In Progress", "Hold", "Open", "Cancelled"].map((s) => (
+            <span key={s}>
+              <i style={{ background: STEP_STYLE[s].bg, border: "1px solid rgba(0,0,0,.12)" }} />
+              {s}
+            </span>
+          ))}
+        </div>
+      </div>
+      {parents.length === 0 ? (
+        <p className="empty-hint">Belum ada induk task. Tambahkan di tabel Induk Task di bawah untuk membentuk tangga.</p>
+      ) : (
+        <div className="stairs-scroll">
+          <div className="stairs">
+            {parents.map((p, i) => {
+              const kids = todos.filter((t) => t.parentId === p.id && t.status !== "Cancelled");
+              const done = kids.filter((t) => t.status === "Complete").length;
+              const st = STEP_STYLE[p.status] || STEP_STYLE.Open;
+              const isTop = i === parents.length - 1;
+              return (
+                <div className="step-col" key={p.id}>
+                  {isTop && <div className="step-flag">🏁</div>}
+                  <div className="step" style={{ height: 78 + i * 34, background: st.bg, color: st.fg, textDecoration: p.status === "Cancelled" ? "line-through" : "none" }}>
+                    <span className="step-no">{p.order === "" || p.order === null || p.order === undefined ? "–" : p.order}</span>
+                    <span className="step-name">{p.name || "(tanpa nama)"}</span>
+                    <span className="step-status">{p.status}</span>
+                    <span className="step-kids">{kids.length === 0 ? "belum ada task" : `${done}/${kids.length} task selesai`}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CareerParentSection({ data, update, todosKey, parentsKey }) {
+  const parents = sortParents(data[parentsKey] || []);
+  const todos = (data[todosKey] || []).map(normalizeTask);
+  const setParents = (fn) => update((d) => ({ ...d, [parentsKey]: fn(d[parentsKey] || []) }));
+  const nextOrder = () => Math.max(0, ...(data[parentsKey] || []).map((p) => (parentOrderVal(p) === Infinity ? 0 : parentOrderVal(p)))) + 1;
+  const add = () => setParents((l) => [...l, { id: uid(), order: nextOrder(), name: "", status: "Open" }]);
+  const edit = (id, field, value) => setParents((l) => l.map((p) => (p.id === id ? { ...p, [field]: field === "order" ? value.replace(/\D/g, "") : value } : p)));
+  const remove = (id) => setParents((l) => l.filter((p) => p.id !== id));
+
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <h3 className="sec-title">Induk Task</h3>
+      <div className="task-table-wrap">
+        <table className="task-table">
+          <thead>
+            <tr>
+              <th style={{ width: 110 }}>No. Urutan</th>
+              <th>Induk Task</th>
+              <th style={{ width: 130 }}>Status</th>
+              <th style={{ width: 110 }}>Jumlah Task</th>
+              <th style={{ width: 36 }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {parents.length === 0 && (
+              <tr>
+                <td colSpan={5} className="task-empty">
+                  Belum ada induk task. Klik "Tambah Induk Task".
+                </td>
+              </tr>
+            )}
+            {parents.map((p) => {
+              const color = TASK_STATUS_COLORS[p.status] || "#8a8a8a";
+              const count = todos.filter((t) => t.parentId === p.id).length;
+              return (
+                <tr key={p.id}>
+                  <td>
+                    <input value={p.order ?? ""} placeholder="1" onChange={(e) => edit(p.id, "order", e.target.value)} />
+                  </td>
+                  <td>
+                    <input value={p.name} placeholder="Nama induk task…" onChange={(e) => edit(p.id, "name", e.target.value)} />
+                  </td>
+                  <td>
+                    <select value={p.status} onChange={(e) => edit(p.id, "status", e.target.value)} style={{ color, fontWeight: 600, background: color + "1f", borderColor: color + "66" }}>
+                      {TASK_STATUSES.map((s) => (
+                        <option key={s} style={{ color: TASK_STATUS_COLORS[s], background: "#fff" }}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="task-no">{count}</td>
+                  <td>
+                    <button
+                      className="icon-btn"
+                      disabled={count > 0}
+                      style={count > 0 ? { opacity: 0.35, cursor: "not-allowed" } : undefined}
+                      onClick={() => remove(p.id)}
+                      title={count > 0 ? "Masih ada task di induk ini" : "Hapus induk task"}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <button type="button" className="btn-primary" onClick={add} style={{ marginTop: 12 }}>
+        <Plus size={16} /> Tambah Induk Task
+      </button>
+    </div>
+  );
+}
+
+function CareerTodoSection({ data, update, appSave, todosKey, parentsKey }) {
+  return (
+    <>
+      <PageSaveBar {...appSave} />
+      <CareerStairs data={data} todosKey={todosKey} parentsKey={parentsKey} />
+      <CareerParentSection data={data} update={update} todosKey={todosKey} parentsKey={parentsKey} />
+      <h3 className="sec-title">Task</h3>
+      <TaskTableSection listKey={todosKey} data={data} update={update} appSave={appSave} parents={sortParents(data[parentsKey] || [])} hideSaveBar />
+    </>
+  );
+}
+
+function CareerTab({ data, update, appSave }) {
+  const [subTab, setSubTab] = useState("p1");
+  const sets = { p1: ["careerTodos", "careerParents"], p2: ["careerTodos2", "careerParents2"] };
+  const [todosKey, parentsKey] = sets[subTab];
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h1>Career</h1>
+        <p className="sub">Kelola task karier beserta induk task dan tangga career plan.</p>
+      </div>
+
+      <div className="subtabs">
+        <button className={subTab === "p1" ? "active" : ""} onClick={() => setSubTab("p1")}>
+          Career Plan 1
+        </button>
+        <button className={subTab === "p2" ? "active" : ""} onClick={() => setSubTab("p2")}>
+          Career Plan 2
+        </button>
+      </div>
+
+      <CareerTodoSection key={subTab} data={data} update={update} appSave={appSave} todosKey={todosKey} parentsKey={parentsKey} />
+    </div>
   );
 }
 
@@ -2414,11 +2677,11 @@ function BusinessTab({ data, update, appSave }) {
       appSave={appSave}
       title="Business"
       sub="Kelola to-do bisnis dan rencana pengembangan usaha."
-      planLabel="Business Plan"
+      plans={[{ key: "plan", label: "Business Plan", listKey: "businessPlan" }]}
       planWord="Plan"
       placeholder="mis. Luncurkan produk pertama…"
       todoKey="businessTodos"
-      planKey="businessPlan"
+      showPic
     />
   );
 }
@@ -3238,6 +3501,19 @@ function App() {
         .task-table tbody tr:last-child td{border-bottom:none;}
         .task-table input,.task-table select{width:100%;font-family:'Inter',sans-serif;font-size:13px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
         .goal-pic-select{font-family:'Inter',sans-serif;font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);max-width:170px;}
+        .sec-title{font-family:'Fraunces',serif;font-size:16px;margin:4px 0 10px;}
+        .stairs-card{margin-bottom:22px;}
+        .stairs-scroll{overflow-x:auto;padding-top:6px;}
+        .stairs{display:flex;align-items:flex-end;gap:4px;min-height:120px;padding:16px 4px 0;}
+        .step-col{flex:1 0 128px;max-width:220px;display:flex;flex-direction:column;justify-content:flex-end;align-items:stretch;position:relative;}
+        .step-flag{text-align:center;font-size:18px;margin-bottom:2px;}
+        .step{border-radius:8px 8px 0 0;padding:10px 10px 8px;display:flex;flex-direction:column;gap:3px;box-sizing:border-box;}
+        .step-no{font-size:11px;font-weight:700;opacity:.8;}
+        .step-name{font-weight:700;font-size:13px;line-height:1.25;word-break:break-word;}
+        .step-status{font-size:11px;font-weight:600;opacity:.9;}
+        .step-kids{font-size:10.5px;opacity:.85;margin-top:auto;}
+        .task-table .rp-input{width:100%;padding:0 8px;box-sizing:border-box;}
+        .task-table .rp-input input{border:none;padding:7px 0;border-radius:0;outline:none;background:transparent;}
         .task-table input:focus,.task-table select:focus{outline:2px solid var(--pine);outline-offset:1px;}
         .task-no{text-align:center;color:var(--ink-soft);font-weight:600;}
         .task-empty{text-align:center;color:var(--ink-soft);padding:22px 10px !important;}
