@@ -527,7 +527,7 @@ const ROLES = [
 ];
 const ROLE_TABS = {
   super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "masterdata", "usermanagement"],
-  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget"],
+  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget", "career", "business"],
 };
 // Accounts created before roles existed keep full access (so nobody is locked out).
 const roleOf = (u) => (u && ROLE_TABS[u.role] ? u.role : "super_admin");
