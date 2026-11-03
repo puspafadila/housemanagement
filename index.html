@@ -2576,11 +2576,18 @@ function CareerParentSection({ data, update, todosKey, parentsKey }) {
   const add = () => setParents((l) => [...l, { id: uid(), order: nextOrder(), name: "", status: "Open" }]);
   const edit = (id, field, value) => setParents((l) => l.map((p) => (p.id === id ? { ...p, [field]: field === "order" ? value.replace(/\D/g, "") : value } : p)));
   const remove = (id) => setParents((l) => l.filter((p) => p.id !== id));
+  const [open, setOpen] = useState(true);
 
   return (
-    <div style={{ marginBottom: 22 }}>
-      <h3 className="sec-title">Induk Task</h3>
-      <div className="task-table-wrap">
+    <div style={{ marginTop: 28 }}>
+      <button type="button" className="sec-toggle" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        {open ? <ChevronDown size={16} strokeWidth={2.2} /> : <ChevronRight size={16} strokeWidth={2.2} />}
+        <span className="sec-title" style={{ margin: 0 }}>Induk Task</span>
+        <span className="sec-count">{parents.length}</span>
+      </button>
+      {open && (
+        <>
+      <div className="task-table-wrap" style={{ marginTop: 10 }}>
         <table className="task-table">
           <thead>
             <tr>
@@ -2640,6 +2647,8 @@ function CareerParentSection({ data, update, todosKey, parentsKey }) {
       <button type="button" className="btn-primary" onClick={add} style={{ marginTop: 12 }}>
         <Plus size={16} /> Tambah Induk Task
       </button>
+        </>
+      )}
     </div>
   );
 }
@@ -2649,9 +2658,9 @@ function CareerTodoSection({ data, update, appSave, todosKey, parentsKey, planNa
     <>
       <PageSaveBar {...appSave} />
       <CareerStairs data={data} todosKey={todosKey} parentsKey={parentsKey} planName={planName} />
-      <CareerParentSection data={data} update={update} todosKey={todosKey} parentsKey={parentsKey} />
       <h3 className="sec-title">Task</h3>
       <TaskTableSection listKey={todosKey} data={data} update={update} appSave={appSave} parents={sortParents(data[parentsKey] || [])} hideSaveBar />
+      <CareerParentSection data={data} update={update} todosKey={todosKey} parentsKey={parentsKey} />
     </>
   );
 }
@@ -3522,6 +3531,8 @@ function App() {
         .task-table tbody tr:last-child td{border-bottom:none;}
         .task-table input,.task-table select{width:100%;font-family:'Inter',sans-serif;font-size:13px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
         .goal-pic-select{font-family:'Inter',sans-serif;font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);max-width:170px;}
+        .sec-toggle{display:flex;align-items:center;gap:8px;background:none;border:none;padding:4px 2px;cursor:pointer;color:var(--ink);font-family:inherit;}
+        .sec-count{font-size:11px;font-weight:700;padding:1px 8px;border-radius:20px;background:var(--track);color:var(--ink-soft);}
         .sec-title{font-family:'Fraunces',serif;font-size:16px;margin:4px 0 10px;}
         .stairs-card{margin-bottom:22px;}
         .stairs-scroll{overflow-x:auto;padding-top:6px;}
