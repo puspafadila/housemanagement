@@ -70,6 +70,12 @@ const GraduationCap = (p) => (
     <path d="M21 9v6" />
   </IconBase>
 );
+const Video = (p) => (
+  <IconBase {...p}>
+    <rect x="2" y="6" width="14" height="12" rx="2" />
+    <path d="M22 8l-6 4 6 4V8z" />
+  </IconBase>
+);
 const Briefcase = (p) => (
   <IconBase {...p}>
     <rect x="3" y="7" width="18" height="13" rx="2" />
@@ -322,6 +328,10 @@ const emptyData = () => ({
   careerParents: [],
   careerTodos2: [],
   careerParents2: [],
+  creatorTodos: [],
+  creatorParents: [],
+  creatorTodos2: [],
+  creatorParents2: [],
   careerPlan: [],
   careerPlan2: [],
   businessTodos: [],
@@ -530,8 +540,8 @@ const ROLES = [
   { value: "user", label: "User" },
 ];
 const ROLE_TABS = {
-  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "masterdata", "usermanagement"],
-  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget", "career", "business"],
+  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator", "masterdata", "usermanagement"],
+  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator"],
 };
 // Accounts created before roles existed keep full access (so nobody is locked out).
 const roleOf = (u) => (u && ROLE_TABS[u.role] ? u.role : "super_admin");
@@ -661,6 +671,8 @@ const TASK_SOURCES = [
   ["Financial", "financialTodos"],
   ["Career Plan 1", "careerTodos"],
   ["Career Plan 2", "careerTodos2"],
+  ["Creator Plan 1", "creatorTodos"],
+  ["Creator Plan 2", "creatorTodos2"],
   ["Business", "businessTodos"],
 ];
 // Plan tables (Career Plan 1/2, Business Plan) also have PIC + status; map their statuses onto the task ones.
@@ -1560,10 +1572,10 @@ const findIncompleteTasks = (data, savedJSON) => {
   try {
     saved = savedJSON ? JSON.parse(savedJSON) : {};
   } catch (e) {}
-  ["educationTodos", "financialTodos", "careerTodos", "careerTodos2", "businessTodos"].forEach((key) => {
+  ["educationTodos", "financialTodos", "careerTodos", "careerTodos2", "creatorTodos", "creatorTodos2", "businessTodos"].forEach((key) => {
     const before = new Map(((saved && saved[key]) || []).map(normalizeTask).map((r) => [r.id, JSON.stringify(r)]));
     ((data && data[key]) || []).map(normalizeTask).forEach((r) => {
-      if ((isTaskRowIncomplete(r) || (key.startsWith("careerTodos") && !r.parentId)) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
+      if ((isTaskRowIncomplete(r) || ((key.startsWith("careerTodos") || key.startsWith("creatorTodos")) && !r.parentId)) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
     });
   });
   return ids;
@@ -2508,14 +2520,14 @@ const STEP_STYLE = {
   Cancelled: { bg: "#c9c9c9", fg: "#555" },
 };
 
-function CareerStairs({ data, todosKey, parentsKey }) {
+function CareerStairs({ data, todosKey, parentsKey, planName }) {
   const parents = sortParents(data[parentsKey] || []);
   const todos = (data[todosKey] || []).map(normalizeTask);
   return (
     <div className="card stairs-card">
       <div className="fp-head">
         <div>
-          <h2>Tangga Career Plan</h2>
+          <h2>Tangga {planName}</h2>
           <p className="fp-sub">Berdasarkan Induk Task, diurutkan dari nomor urutan terkecil (anak tangga paling bawah).</p>
         </div>
         <div className="tp-legend">
@@ -2632,11 +2644,11 @@ function CareerParentSection({ data, update, todosKey, parentsKey }) {
   );
 }
 
-function CareerTodoSection({ data, update, appSave, todosKey, parentsKey }) {
+function CareerTodoSection({ data, update, appSave, todosKey, parentsKey, planName }) {
   return (
     <>
       <PageSaveBar {...appSave} />
-      <CareerStairs data={data} todosKey={todosKey} parentsKey={parentsKey} />
+      <CareerStairs data={data} todosKey={todosKey} parentsKey={parentsKey} planName={planName} />
       <CareerParentSection data={data} update={update} todosKey={todosKey} parentsKey={parentsKey} />
       <h3 className="sec-title">Task</h3>
       <TaskTableSection listKey={todosKey} data={data} update={update} appSave={appSave} parents={sortParents(data[parentsKey] || [])} hideSaveBar />
@@ -2644,29 +2656,37 @@ function CareerTodoSection({ data, update, appSave, todosKey, parentsKey }) {
   );
 }
 
-function CareerTab({ data, update, appSave }) {
+function LadderModuleTab({ data, update, appSave, title, sub, prefix, planName }) {
   const [subTab, setSubTab] = useState("p1");
-  const sets = { p1: ["careerTodos", "careerParents"], p2: ["careerTodos2", "careerParents2"] };
+  const sets = { p1: [prefix + "Todos", prefix + "Parents"], p2: [prefix + "Todos2", prefix + "Parents2"] };
   const [todosKey, parentsKey] = sets[subTab];
   return (
     <div className="panel">
       <div className="panel-head">
-        <h1>Career</h1>
-        <p className="sub">Kelola task karier beserta induk task dan tangga career plan.</p>
+        <h1>{title}</h1>
+        <p className="sub">{sub}</p>
       </div>
 
       <div className="subtabs">
         <button className={subTab === "p1" ? "active" : ""} onClick={() => setSubTab("p1")}>
-          Career Plan 1
+          {planName} 1
         </button>
         <button className={subTab === "p2" ? "active" : ""} onClick={() => setSubTab("p2")}>
-          Career Plan 2
+          {planName} 2
         </button>
       </div>
 
-      <CareerTodoSection key={subTab} data={data} update={update} appSave={appSave} todosKey={todosKey} parentsKey={parentsKey} />
+      <CareerTodoSection key={subTab} data={data} update={update} appSave={appSave} todosKey={todosKey} parentsKey={parentsKey} planName={planName} />
     </div>
   );
+}
+
+function CareerTab({ data, update, appSave }) {
+  return <LadderModuleTab data={data} update={update} appSave={appSave} title="Career" sub="Kelola task karier beserta induk task dan tangga career plan." prefix="career" planName="Career Plan" />;
+}
+
+function CreatorTab({ data, update, appSave }) {
+  return <LadderModuleTab data={data} update={update} appSave={appSave} title="Content Creator" sub="Kelola task kreator beserta induk task dan tangga creator plan." prefix="creator" planName="Creator Plan" />;
 }
 
 function BusinessTab({ data, update, appSave }) {
@@ -2963,6 +2983,7 @@ const NAV_GROUP = {
     { key: "budget", label: "Financial", icon: Wallet },
     { key: "career", label: "Career", icon: Briefcase },
     { key: "business", label: "Business", icon: Store },
+    { key: "creator", label: "Content Creator", icon: Video },
   ],
 };
 
@@ -3867,6 +3888,7 @@ function App() {
             )}
             {tab === "budget" && canAccess("budget") && <BudgetTab data={data} update={update} appSave={appSave} subTab={finSubTab} setSubTab={setFinSubTab} />}
             {tab === "career" && canAccess("career") && <CareerTab data={data} update={update} appSave={appSave} />}
+            {tab === "creator" && canAccess("creator") && <CreatorTab data={data} update={update} appSave={appSave} />}
             {tab === "business" && canAccess("business") && <BusinessTab data={data} update={update} appSave={appSave} />}
             {tab === "masterdata" && canAccess("masterdata") && <MasterDataTab data={data} update={update} appSave={appSave} />}
             {tab === "usermanagement" && canAccess("usermanagement") && (
