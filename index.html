@@ -1250,6 +1250,7 @@ const REIMBURSE_OPTIONS = [
   { value: "On review", color: "#c0392b" },
   { value: "Waiting for payment", color: "#c0392b" },
   { value: "Paid", color: "#1e8449" },
+  { value: "Rejected", color: "#c0392b" },
 ];
 // Older records stored a checkbox (true/false); map them onto the new list.
 const reimburseValue = (v) => (v === true ? "Paid" : REIMBURSE_OPTIONS.some((o) => o.value === v) ? v : "Need submission");
