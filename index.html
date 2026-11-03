@@ -70,6 +70,21 @@ const GraduationCap = (p) => (
     <path d="M21 9v6" />
   </IconBase>
 );
+const Briefcase = (p) => (
+  <IconBase {...p}>
+    <rect x="3" y="7" width="18" height="13" rx="2" />
+    <path d="M9 7V5a2 2 0 012-2h2a2 2 0 012 2v2" />
+    <path d="M3 13h18" />
+  </IconBase>
+);
+const Store = (p) => (
+  <IconBase {...p}>
+    <path d="M4 9l1.5-5h13L20 9" />
+    <path d="M4 9a2.67 2.67 0 005.33 0 2.67 2.67 0 005.34 0A2.67 2.67 0 0020 9" />
+    <path d="M5 11.5V20h14v-8.5" />
+    <path d="M10 20v-5h4v5" />
+  </IconBase>
+);
 const Wallet = (p) => (
   <IconBase {...p}>
     <path d="M3 7.5A2.5 2.5 0 015.5 5h11A2.5 2.5 0 0119 7.5v9a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 013 16.5v-9z" />
@@ -303,6 +318,10 @@ const emptyData = () => ({
   education: [],
   educationTodos: [],
   financialTodos: [],
+  careerTodos: [],
+  careerPlan: [],
+  businessTodos: [],
+  businessPlan: [],
   budget: {
     allocations: { belanja: 0, nanny: 0, kesehatan: 0, pendidikan: 0, lainnya: 0 },
     lainnyaItems: [],
@@ -507,7 +526,7 @@ const ROLES = [
   { value: "user", label: "User" },
 ];
 const ROLE_TABS = {
-  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "masterdata", "usermanagement"],
+  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "masterdata", "usermanagement"],
   user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget"],
 };
 // Accounts created before roles existed keep full access (so nobody is locked out).
@@ -1428,7 +1447,7 @@ const findIncompleteTasks = (data, savedJSON) => {
   try {
     saved = savedJSON ? JSON.parse(savedJSON) : {};
   } catch (e) {}
-  ["educationTodos", "financialTodos"].forEach((key) => {
+  ["educationTodos", "financialTodos", "careerTodos", "businessTodos"].forEach((key) => {
     const before = new Map(((saved && saved[key]) || []).map(normalizeTask).map((r) => [r.id, JSON.stringify(r)]));
     ((data && data[key]) || []).map(normalizeTask).forEach((r) => {
       if (isTaskRowIncomplete(r) && before.get(r.id) !== JSON.stringify(r)) ids.add(key + ":" + r.id);
@@ -1856,7 +1875,22 @@ function PendidikanTab({ data, update, subTab, setSubTab, eduPlanDirty, eduSavin
 /* ---------------------------------------------------------
    Financial Tab — savings goals (tracking) + long-term projections
 --------------------------------------------------------- */
-function GoalCard({ goal, expanded, onToggleExpand, onRemove, onUpdateField, onAddContribution, onRemoveContribution }) {
+function PicSelect({ value, onChange, users, className, style }) {
+  const label = (u) => (ROLES.find((r) => r.value === roleOf(u)) || ROLES[0]).label;
+  return (
+    <select className={className} style={style} value={value || ""} onChange={(e) => onChange(e.target.value)}>
+      <option value="">— pilih PIC —</option>
+      {value && !users.some((u) => u.username === value) && <option value={value}>{value}</option>}
+      {users.map((u) => (
+        <option key={u.id} value={u.username}>
+          {u.username} ({label(u)})
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function GoalCard({ users, goal, expanded, onToggleExpand, onRemove, onUpdateField, onAddContribution, onRemoveContribution }) {
   const [contribDate, setContribDate] = useState(todayISO());
   const [contribAmount, setContribAmount] = useState("");
   const [contribBank, setContribBank] = useState("");
@@ -1919,6 +1953,10 @@ function GoalCard({ goal, expanded, onToggleExpand, onRemove, onUpdateField, onA
             onChange={(e) => onUpdateField("priority", e.target.value.replace(/\D/g, ""))}
             placeholder="—"
           />
+        </div>
+        <div>
+          <span className="mini-label">PIC</span>
+          <PicSelect className="goal-pic-select" value={goal.pic} onChange={(v) => onUpdateField("pic", v)} users={users} />
         </div>
         <div>
           <span className="mini-label">Terkumpul</span>
@@ -1996,16 +2034,29 @@ function SavingsGoalsSection({ data, update }) {
   const [target, setTarget] = useState("");
   const [targetDate, setTargetDate] = useState("");
   const [priority, setPriority] = useState("");
+  const [pic, setPic] = useState("");
+  const users = data.users || [];
+  const [addError, setAddError] = useState("");
 
   const addGoal = () => {
-    if (!name.trim() || !target) return;
+    if (!name.trim() || !target || Number(target) <= 0) {
+      setAddError(
+        !name.trim() && !(Number(target) > 0)
+          ? "Isi Nama tujuan dan Target nominal terlebih dahulu."
+          : !name.trim()
+          ? "Nama tujuan belum diisi."
+          : "Target nominal belum diisi (harus lebih dari 0)."
+      );
+      return;
+    }
+    setAddError("");
     const id = uid();
     update((d) => ({
       ...d,
       financial: {
         ...d.financial,
         goals: [
-          { id, name: name.trim(), target: Number(target) || 0, targetDate, priority: priority ? Number(priority) : null, contributions: [] },
+          { id, name: name.trim(), target: Number(target) || 0, targetDate, priority: priority ? Number(priority) : null, pic, contributions: [] },
           ...(d.financial.goals || []),
         ],
       },
@@ -2015,6 +2066,7 @@ function SavingsGoalsSection({ data, update }) {
     setTarget("");
     setTargetDate("");
     setPriority("");
+    setPic("");
   };
 
   const removeGoal = (id) => update((d) => ({ ...d, financial: { ...d.financial, goals: (d.financial.goals || []).filter((g) => g.id !== id) } }));
@@ -2100,10 +2152,14 @@ function SavingsGoalsSection({ data, update }) {
             style={{ width: 90 }}
           />
         </Field>
+        <Field label="PIC (opsional)">
+          <PicSelect value={pic} onChange={setPic} users={users} />
+        </Field>
         <button type="button" className="btn-primary" onClick={addGoal} style={{ alignSelf: "flex-end" }}>
           <Plus size={16} /> Tambah Tujuan
         </button>
       </div>
+      {addError && <p className="empty-hint" style={{ color: "var(--clay)", margin: "-8px 0 12px", maxWidth: "none" }}>{addError}</p>}
 
       {sorted.length === 0 ? (
         <EmptyState icon={PiggyBank} title="Belum ada tujuan tabungan" hint="Tambahkan tujuan tabungan atau investasi untuk mulai melacak progres." />
@@ -2111,6 +2167,7 @@ function SavingsGoalsSection({ data, update }) {
         <div className="period-list">
           {sorted.map((g) => (
             <GoalCard
+              users={users}
               key={g.id}
               goal={g}
               expanded={expanded.has(g.id)}
@@ -2129,6 +2186,155 @@ function SavingsGoalsSection({ data, update }) {
 
 function FinancialTodoSection({ data, update, appSave }) {
   return <TaskTableSection listKey="financialTodos" data={data} update={update} appSave={appSave} />;
+}
+
+/* ---------------------------------------------------------
+   Career & Business — each has a To-Do table and a Plan table
+--------------------------------------------------------- */
+const PLAN_STATUSES = ["Not Started", "In Progress", "Achieved", "On Hold", "Cancelled"];
+const PLAN_STATUS_COLORS = {
+  "Not Started": "#8a8a8a",
+  "In Progress": "#d9822b",
+  Achieved: "#1e8449",
+  "On Hold": "#8a8a8a",
+  Cancelled: "#8a8a8a",
+};
+
+function PlanTableSection({ listKey, data, update, appSave, planWord, placeholder }) {
+  const rows = data[listKey] || [];
+  const setRows = (fn) => update((d) => ({ ...d, [listKey]: fn(d[listKey] || []) }));
+  const addRow = () => setRows((list) => [...list, { id: uid(), plan: "", detail: "", targetDate: "", status: "Not Started" }]);
+  const editRow = (id, field, value) => setRows((list) => list.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
+  const removeRow = (id) => setRows((list) => list.filter((r) => r.id !== id));
+
+  return (
+    <>
+      <PageSaveBar {...appSave} />
+
+      <div className="task-table-wrap">
+        <table className="task-table">
+          <thead>
+            <tr>
+              <th style={{ width: 58 }}>No</th>
+              <th>{planWord}</th>
+              <th>Detail</th>
+              <th style={{ width: 150 }}>Target Date</th>
+              <th style={{ width: 150 }}>Status</th>
+              <th style={{ width: 36 }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={6} className="task-empty">
+                  Belum ada rencana. Klik "Tambah Baris" untuk menambahkan.
+                </td>
+              </tr>
+            )}
+            {rows.map((r, i) => {
+              const color = PLAN_STATUS_COLORS[r.status] || "#8a8a8a";
+              return (
+                <tr key={r.id}>
+                  <td className="task-no">{i + 1}</td>
+                  <td>
+                    <input value={r.plan} placeholder={placeholder} onChange={(e) => editRow(r.id, "plan", e.target.value)} />
+                  </td>
+                  <td>
+                    <input value={r.detail} placeholder="Detail / langkah…" onChange={(e) => editRow(r.id, "detail", e.target.value)} />
+                  </td>
+                  <td>
+                    <input type="date" value={r.targetDate} onChange={(e) => editRow(r.id, "targetDate", e.target.value)} />
+                  </td>
+                  <td>
+                    <select
+                      value={r.status}
+                      onChange={(e) => editRow(r.id, "status", e.target.value)}
+                      style={{ color, fontWeight: 600, background: color + "1f", borderColor: color + "66" }}
+                    >
+                      {PLAN_STATUSES.map((s) => (
+                        <option key={s} style={{ color: PLAN_STATUS_COLORS[s], background: "#fff" }}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <button className="icon-btn" onClick={() => removeRow(r.id)} title="Hapus baris">
+                      <Trash2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <button type="button" className="btn-primary" onClick={addRow} style={{ marginTop: 12 }}>
+        <Plus size={16} /> Tambah Baris
+      </button>
+    </>
+  );
+}
+
+function PlanModuleTab({ data, update, appSave, title, sub, planLabel, planWord, placeholder, todoKey, planKey }) {
+  const [subTab, setSubTab] = useState("todo");
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h1>{title}</h1>
+        <p className="sub">{sub}</p>
+      </div>
+
+      <div className="subtabs">
+        <button className={subTab === "todo" ? "active" : ""} onClick={() => setSubTab("todo")}>
+          To-Do
+        </button>
+        <button className={subTab === "plan" ? "active" : ""} onClick={() => setSubTab("plan")}>
+          {planLabel}
+        </button>
+      </div>
+
+      {subTab === "todo" ? (
+        <TaskTableSection listKey={todoKey} data={data} update={update} appSave={appSave} />
+      ) : (
+        <PlanTableSection listKey={planKey} data={data} update={update} appSave={appSave} planWord={planWord} placeholder={placeholder} />
+      )}
+    </div>
+  );
+}
+
+function CareerTab({ data, update, appSave }) {
+  return (
+    <PlanModuleTab
+      data={data}
+      update={update}
+      appSave={appSave}
+      title="Career"
+      sub="Kelola to-do karier dan rencana pengembangan karier jangka panjang."
+      planLabel="Career Plan"
+      planWord="Plan"
+      placeholder="mis. Naik ke posisi senior…"
+      todoKey="careerTodos"
+      planKey="careerPlan"
+    />
+  );
+}
+
+function BusinessTab({ data, update, appSave }) {
+  return (
+    <PlanModuleTab
+      data={data}
+      update={update}
+      appSave={appSave}
+      title="Business"
+      sub="Kelola to-do bisnis dan rencana pengembangan usaha."
+      planLabel="Business Plan"
+      planWord="Plan"
+      placeholder="mis. Luncurkan produk pertama…"
+      todoKey="businessTodos"
+      planKey="businessPlan"
+    />
+  );
 }
 
 function BudgetTab({ data, update, appSave, subTab, setSubTab }) {
@@ -2406,6 +2612,8 @@ const NAV_GROUP = {
     { key: "kesehatan", label: "Health", icon: HeartPulse },
     { key: "pendidikan", label: "Education", icon: GraduationCap },
     { key: "budget", label: "Financial", icon: Wallet },
+    { key: "career", label: "Career", icon: Briefcase },
+    { key: "business", label: "Business", icon: Store },
   ],
 };
 
@@ -2943,6 +3151,7 @@ function App() {
         .task-table td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle;}
         .task-table tbody tr:last-child td{border-bottom:none;}
         .task-table input,.task-table select{width:100%;font-family:'Inter',sans-serif;font-size:13px;padding:7px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
+        .goal-pic-select{font-family:'Inter',sans-serif;font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);max-width:170px;}
         .task-table input:focus,.task-table select:focus{outline:2px solid var(--pine);outline-offset:1px;}
         .task-no{text-align:center;color:var(--ink-soft);font-weight:600;}
         .task-empty{text-align:center;color:var(--ink-soft);padding:22px 10px !important;}
@@ -3283,6 +3492,8 @@ function App() {
               />
             )}
             {tab === "budget" && canAccess("budget") && <BudgetTab data={data} update={update} appSave={appSave} subTab={finSubTab} setSubTab={setFinSubTab} />}
+            {tab === "career" && canAccess("career") && <CareerTab data={data} update={update} appSave={appSave} />}
+            {tab === "business" && canAccess("business") && <BusinessTab data={data} update={update} appSave={appSave} />}
             {tab === "masterdata" && canAccess("masterdata") && <MasterDataTab data={data} update={update} appSave={appSave} />}
             {tab === "usermanagement" && canAccess("usermanagement") && (
               <UserManagementTab data={data} update={update} appSave={appSave} currentUsername={authedUsername} />
