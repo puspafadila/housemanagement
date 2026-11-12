@@ -116,6 +116,18 @@ const Check = (p) => (
     <path d="M4.5 12.5l5 5 10-11" />
   </IconBase>
 );
+const ChevronLeft = (p) => (
+  <IconBase {...p}>
+    <path d="M15 6l-6 6 6 6" />
+  </IconBase>
+);
+const CalendarClock = (p) => (
+  <IconBase {...p}>
+    <rect x="3" y="4" width="18" height="17" rx="2" />
+    <path d="M3 9h18M8 2v4M16 2v4" />
+    <path d="M12 13v3l2 1" />
+  </IconBase>
+);
 const Calendar = (p) => (
   <IconBase {...p}>
     <rect x="3.5" y="5" width="17" height="16" rx="2" />
@@ -332,6 +344,7 @@ const emptyData = () => ({
   creatorParents: [],
   creatorTodos2: [],
   creatorParents2: [],
+  scheduleItems: [],
   careerPlan: [],
   careerPlan2: [],
   businessTodos: [],
@@ -540,8 +553,8 @@ const ROLES = [
   { value: "user", label: "User" },
 ];
 const ROLE_TABS = {
-  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator", "masterdata", "usermanagement"],
-  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator"],
+  super_admin: ["dashboard", "todo", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator", "schedule", "masterdata", "usermanagement"],
+  user: ["dashboard", "nanny", "kesehatan", "pendidikan", "budget", "career", "business", "creator", "schedule"],
 };
 // Accounts created before roles existed keep full access (so nobody is locked out).
 const roleOf = (u) => (u && ROLE_TABS[u.role] ? u.role : "super_admin");
@@ -2698,6 +2711,449 @@ function CreatorTab({ data, update, appSave }) {
   return <LadderModuleTab data={data} update={update} appSave={appSave} title="Content Creator" sub="Kelola task kreator beserta induk task dan tangga creator plan." prefix="creator" planName="Creator Plan" />;
 }
 
+/* ---------------------------------------------------------
+   Schedule — daily schedule planner
+--------------------------------------------------------- */
+/* ---------------------------------------------------------
+   Schedule — daily list + calendar (week / day) views
+--------------------------------------------------------- */
+// Accepts "9", "930", "09:30", "9.30", "9:30 pm", … and returns "HH:MM" ("" for empty, null if invalid).
+function parseTimeInput(str) {
+  let t = String(str || "").trim().toLowerCase().replace(/[.,]/g, ":").replace(/\s+/g, "");
+  if (!t) return "";
+  let m;
+  let suffix = "";
+  const sm = t.match(/(am|pm)$/);
+  if (sm) {
+    suffix = sm[1];
+    t = t.slice(0, -2);
+  }
+  let h, mi;
+  if (/^\d{3,4}$/.test(t)) {
+    h = Number(t.slice(0, -2));
+    mi = Number(t.slice(-2));
+  } else if ((m = t.match(/^(\d{1,2})(?::(\d{1,2}))?$/))) {
+    h = Number(m[1]);
+    mi = m[2] === undefined ? 0 : Number(m[2]);
+  } else return null;
+  if (suffix) {
+    if (h < 1 || h > 12) return null;
+    h = (h % 12) + (suffix === "pm" ? 12 : 0);
+  }
+  if (h > 23 || mi > 59) return null;
+  return pad2(h) + ":" + pad2(mi);
+}
+
+// Free-text time field: type, edit or paste; it is normalised to HH:MM when you leave the field.
+function TimeInput({ value, onChange, className, title }) {
+  const [text, setText] = useState(value || "");
+  useEffect(() => {
+    setText(value || "");
+  }, [value]);
+  const commit = (txt, final) => {
+    const p = parseTimeInput(txt);
+    if (p === null) {
+      if (final) setText(value || "");
+      return;
+    }
+    if (final) setText(p);
+    if (p !== (value || "")) onChange(p);
+  };
+  return (
+    <input
+      className={className}
+      title={title}
+      inputMode="numeric"
+      placeholder="HH:MM"
+      value={text}
+      style={{ textAlign: "center" }}
+      onChange={(e) => {
+        const v = e.target.value;
+        setText(v);
+        if (v === "" || /^\d{1,2}:\d{2}$/.test(v)) commit(v, false);
+      }}
+      onBlur={() => commit(text, true)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+      }}
+    />
+  );
+}
+
+const timeToMin = (t) => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(t || "");
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+};
+const minToTime = (n) => pad2(Math.floor(n / 60) % 24) + ":" + pad2(n % 60);
+const SCH_COLORS = ["#2F5D50", "#B85A38", "#4F6CA8", "#9C4F7C", "#8A7A2E", "#3F7F9A", "#6B5B95"];
+// Colour per person = position in the user list, so everyone gets a distinct colour.
+const schColor = (pic, users) => {
+  const i = (users || []).findIndex((u) => u.username === pic);
+  return !pic || i < 0 ? "#8a8a8a" : SCH_COLORS[i % SCH_COLORS.length];
+};
+const DAY_SHORT = ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"];
+const CAL_HOUR_H = 48;
+
+const addDaysISO = (iso, n) => {
+  const d = new Date(iso + "T12:00:00");
+  d.setDate(d.getDate() + n);
+  return toLocalISO(d);
+};
+const mondayOf = (iso) => addDaysISO(iso, -((new Date(iso + "T12:00:00").getDay() + 6) % 7));
+
+// Lay out overlapping events side by side (simple column packing per overlap cluster).
+function layoutDayEvents(events) {
+  const sorted = [...events].sort((a, b) => a.s - b.s || a.e - b.e);
+  const out = [];
+  let cluster = [];
+  let clusterEnd = -1;
+  const flush = () => {
+    const cols = [];
+    cluster.forEach((ev) => {
+      let c = cols.findIndex((end) => end <= ev.s);
+      if (c === -1) {
+        c = cols.length;
+        cols.push(ev.e);
+      } else cols[c] = ev.e;
+      ev.col = c;
+    });
+    cluster.forEach((ev) => out.push({ ...ev, cols: cols.length }));
+    cluster = [];
+  };
+  sorted.forEach((ev) => {
+    if (cluster.length && ev.s >= clusterEnd) {
+      flush();
+      clusterEnd = -1;
+    }
+    cluster.push(ev);
+    clusterEnd = Math.max(clusterEnd, ev.e);
+  });
+  if (cluster.length) flush();
+  return out;
+}
+
+function ScheduleCalendar({ items, users, view, date, onOpen, onCreate }) {
+  const days = view === "week" ? Array.from({ length: 7 }, (_, i) => addDaysISO(mondayOf(date), i)) : [date];
+  const today = todayISO();
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(t);
+  }, []);
+  const scrollRef = useRef(null);
+
+  const perDay = days.map((d) =>
+    items
+      .filter((r) => r.date === d && timeToMin(r.start) !== null)
+      .map((r) => {
+        const s = timeToMin(r.start);
+        let e = timeToMin(r.end);
+        if (e === null || e <= s) e = s + 60;
+        return { r, s, e };
+      })
+  );
+  const all = perDay.flat();
+  const startH = Math.max(0, Math.min(6, ...all.map((x) => Math.floor(x.s / 60))));
+  const endH = Math.min(24, Math.max(22, ...all.map((x) => Math.ceil(x.e / 60))));
+  const hours = Array.from({ length: endH - startH }, (_, i) => startH + i);
+  const noTime = items.filter((r) => days.includes(r.date) && timeToMin(r.start) === null).length;
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    const first = all.length ? Math.min(...all.map((x) => x.s)) : 8 * 60;
+    scrollRef.current.scrollTop = Math.max(0, ((first - startH * 60) / 60 - 1) * CAL_HOUR_H);
+    // eslint-disable-next-line
+  }, [view, date]);
+
+  const cell = (d, e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const mins = startH * 60 + Math.floor(((e.clientY - rect.top) / CAL_HOUR_H) * 2) * 30;
+    onCreate(d, mins);
+  };
+
+  return (
+    <div className="cal">
+      <div className="cal-scroll" ref={scrollRef} style={{ "--n": days.length }}>
+        <div className="cal-head">
+          <div />
+          {days.map((d) => {
+            const dt = new Date(d + "T12:00:00");
+            return (
+              <div key={d} className={d === today ? "today" : ""}>
+                <span>{DAY_SHORT[(dt.getDay() + 6) % 7]}</span>
+                <b className="num">{dt.getDate()}</b>
+              </div>
+            );
+          })}
+        </div>
+        <div className="cal-body">
+          <div className="cal-hours">
+            {hours.map((h) => (
+              <div key={h}>{pad2(h)}:00</div>
+            ))}
+          </div>
+          {days.map((d, di) => (
+            <div key={d} className="cal-col" style={{ height: hours.length * CAL_HOUR_H }} onDoubleClick={(e) => cell(d, e)} title="Klik dua kali untuk menambah kegiatan">
+              {d === today && nowMin >= startH * 60 && nowMin <= endH * 60 && <div className="cal-now" style={{ top: ((nowMin - startH * 60) / 60) * CAL_HOUR_H }} />}
+              {layoutDayEvents(perDay[di]).map(({ r, s, e, col, cols }) => {
+                const c = schColor(r.pic, users);
+                const done = r.status === "Complete" || r.status === "Cancelled";
+                const h = Math.max(22, ((e - s) / 60) * CAL_HOUR_H - 2);
+                return (
+                  <div
+                    key={r.id}
+                    className="cal-ev"
+                    onDoubleClick={(ev) => ev.stopPropagation()}
+                    onClick={() => onOpen(r)}
+                    title={`${r.start}–${minToTime(e)} · ${r.title || "(tanpa judul)"}${r.pic ? " · " + r.pic : ""} · ${r.status}`}
+                    style={{
+                      top: ((s - startH * 60) / 60) * CAL_HOUR_H + 1,
+                      height: h,
+                      left: `calc(${(col / cols) * 100}% + 2px)`,
+                      width: `calc(${100 / cols}% - 4px)`,
+                      background: c + "38",
+                      borderLeftColor: c,
+                      opacity: done ? 0.55 : 1,
+                      textDecoration: done ? "line-through" : "none",
+                    }}
+                  >
+                    <b>{r.title || "(tanpa judul)"}</b>
+                    {h >= 40 && (
+                      <span>
+                        {r.start}–{minToTime(e)}
+                        {r.pic ? " · " + r.pic : ""}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+      {noTime > 0 && <div className="cal-note">{noTime} kegiatan belum punya jam mulai, jadi tidak tampil di calendar.</div>}
+    </div>
+  );
+}
+
+function ScheduleTab({ data, update, appSave }) {
+  const users = data.users || [];
+  const [sub, setSub] = useState("list");
+  const [calView, setCalView] = useState("week");
+  const [date, setDate] = useState(todayISO());
+  const [picFilter, setPicFilter] = useState("");
+  // Rows being edited keep their position until focus leaves the row, then they re-sort by start time.
+  const [frozen, setFrozen] = useState({});
+  const all = data.scheduleItems || [];
+  const setItems = (fn) => update((d) => ({ ...d, scheduleItems: fn(d.scheduleItems || []) }));
+  const isCal = sub === "calendar";
+  const step = isCal && calView === "week" ? 7 : 1;
+
+  const shiftDate = (n) => setDate((d) => addDaysISO(d, n));
+  const fmt = (iso, opts) => new Date(iso + "T12:00:00").toLocaleDateString("id-ID", opts);
+  const dayLabel = fmt(date, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  const weekLabel = (() => {
+    const a = mondayOf(date), b = addDaysISO(a, 6);
+    const sameMonth = a.slice(0, 7) === b.slice(0, 7);
+    return sameMonth
+      ? `${fmt(a, { day: "numeric" })} – ${fmt(b, { day: "numeric", month: "long", year: "numeric" })}`
+      : `${fmt(a, { day: "numeric", month: "short" })} – ${fmt(b, { day: "numeric", month: "short", year: "numeric" })}`;
+  })();
+
+  const visible = all.filter((r) => !picFilter || r.pic === picFilter);
+  const rows = visible
+    .filter((r) => r.date === date)
+    .sort((a, b) => {
+      const sa = frozen[a.id] !== undefined ? frozen[a.id] : a.start;
+      const sb = frozen[b.id] !== undefined ? frozen[b.id] : b.start;
+      if (!sa && !sb) return 0;
+      if (!sa) return 1;
+      if (!sb) return -1;
+      return sa < sb ? -1 : sa > sb ? 1 : (a.end || "") < (b.end || "") ? -1 : 1;
+    });
+  const doneCount = rows.filter((r) => r.status === "Complete").length;
+
+  const addRowAt = (d, start, end) => {
+    const id = uid();
+    setFrozen((f) => ({ ...f, [id]: start || "" }));
+    setItems((l) => [...l, { id, date: d, start: start || "", end: end || "", title: "", pic: picFilter, status: "Open" }]);
+  };
+  const editRow = (id, field, value) => {
+    const cur = all.find((r) => r.id === id);
+    if (cur) setFrozen((f) => (f[id] !== undefined ? f : { ...f, [id]: cur.start }));
+    setItems((l) => l.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
+  };
+  const unfreeze = (id) =>
+    setFrozen((f) => {
+      if (f[id] === undefined) return f;
+      const n = { ...f };
+      delete n[id];
+      return n;
+    });
+  const removeRow = (id) => setItems((l) => l.filter((r) => r.id !== id));
+  const isToday = date === todayISO();
+  const usedPics = [...new Set(visible.map((r) => r.pic || ""))];
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h1>Schedule</h1>
+        <p className="sub">Susun jadwal harian: jam, kegiatan, dan penanggung jawab.</p>
+      </div>
+
+      <div className="subtabs">
+        <button className={sub === "list" ? "active" : ""} onClick={() => setSub("list")}>
+          Jadwal Harian
+        </button>
+        <button className={sub === "calendar" ? "active" : ""} onClick={() => setSub("calendar")}>
+          Calendar
+        </button>
+      </div>
+
+      <PageSaveBar {...appSave} />
+
+      <div className="sch-nav">
+        <button type="button" className="btn-secondary" onClick={() => shiftDate(-step)} title="Sebelumnya">
+          <ChevronLeft size={16} />
+        </button>
+        <input type="date" value={date} onChange={(e) => e.target.value && setDate(e.target.value)} />
+        <button type="button" className="btn-secondary" onClick={() => shiftDate(step)} title="Berikutnya">
+          <ChevronRight size={16} />
+        </button>
+        <button type="button" className="btn-secondary" onClick={() => setDate(todayISO())} disabled={isToday}>
+          Hari Ini
+        </button>
+        {isCal && (
+          <div className="sch-seg">
+            <button className={calView === "week" ? "active" : ""} onClick={() => setCalView("week")}>
+              Minggu
+            </button>
+            <button className={calView === "day" ? "active" : ""} onClick={() => setCalView("day")}>
+              Hari
+            </button>
+          </div>
+        )}
+        <select className="sch-pic-filter" value={picFilter} onChange={(e) => setPicFilter(e.target.value)}>
+          <option value="">Semua PIC</option>
+          {users.map((u) => (
+            <option key={u.id} value={u.username}>
+              {u.username}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {isCal ? (
+        <>
+          <div className="sch-day">
+            <strong>{calView === "week" ? weekLabel : dayLabel}</strong>
+            <span>Klik kegiatan untuk mengedit · klik dua kali di area kosong untuk menambah</span>
+          </div>
+          <div className="tp-legend" style={{ marginBottom: 10 }}>
+            {usedPics.map((p) => (
+              <span key={p || "none"}>
+                <i style={{ background: schColor(p, users) }} />
+                {p || "(tanpa PIC)"}
+              </span>
+            ))}
+          </div>
+          <ScheduleCalendar
+            items={visible}
+            users={users}
+            view={calView}
+            date={date}
+            onOpen={(r) => {
+              setDate(r.date);
+              setSub("list");
+            }}
+            onCreate={(d, mins) => {
+              setDate(d);
+              addRowAt(d, minToTime(mins), minToTime(Math.min(mins + 60, 23 * 60 + 59)));
+              setSub("list");
+            }}
+          />
+        </>
+      ) : (
+        <>
+          <div className="sch-day">
+            <strong>{dayLabel}</strong>
+            <span>
+              {rows.length} kegiatan · {doneCount} selesai
+            </span>
+          </div>
+
+          <div className="task-table-wrap">
+            <table className="task-table">
+              <thead>
+                <tr>
+                  <th style={{ width: 84 }}>Mulai</th>
+                  <th style={{ width: 84 }}>Selesai</th>
+                  <th>Kegiatan</th>
+                  <th style={{ width: 150 }}>PIC</th>
+                  <th style={{ width: 120 }}>Status</th>
+                  <th style={{ width: 36 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="task-empty">
+                      Belum ada jadwal untuk hari ini. Klik "Tambah Kegiatan".
+                    </td>
+                  </tr>
+                )}
+                {rows.map((r) => {
+                  const color = TASK_STATUS_COLORS[r.status] || "#8a8a8a";
+                  const bad = r.start && r.end && r.end < r.start;
+                  return (
+                    <tr
+                      key={r.id}
+                      onBlur={(e) => {
+                        if (!e.currentTarget.contains(e.relatedTarget)) unfreeze(r.id);
+                      }}
+                    >
+                      <td>
+                        <TimeInput value={r.start} onChange={(v) => editRow(r.id, "start", v)} />
+                      </td>
+                      <td>
+                        <TimeInput className={bad ? "cell-err" : ""} title={bad ? "Jam selesai lebih awal dari jam mulai" : ""} value={r.end} onChange={(v) => editRow(r.id, "end", v)} />
+                      </td>
+                      <td>
+                        <input value={r.title} placeholder="mis. Antar anak sekolah" onChange={(e) => editRow(r.id, "title", e.target.value)} />
+                      </td>
+                      <td>
+                        <PicSelect value={r.pic} onChange={(v) => editRow(r.id, "pic", v)} users={users} />
+                      </td>
+                      <td>
+                        <select value={r.status} onChange={(e) => editRow(r.id, "status", e.target.value)} style={{ color, fontWeight: 600, background: color + "1f", borderColor: color + "66" }}>
+                          {TASK_STATUSES.map((s) => (
+                            <option key={s} style={{ color: TASK_STATUS_COLORS[s], background: "#fff" }}>
+                              {s}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <button className="icon-btn" onClick={() => removeRow(r.id)} title="Hapus kegiatan">
+                          <Trash2 size={15} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <button type="button" className="btn-primary" onClick={() => addRowAt(date, "", "")} style={{ marginTop: 12 }}>
+            <Plus size={16} /> Tambah Kegiatan
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function BusinessTab({ data, update, appSave }) {
   return (
     <PlanModuleTab
@@ -2993,6 +3449,7 @@ const NAV_GROUP = {
     { key: "career", label: "Career", icon: Briefcase },
     { key: "business", label: "Business", icon: Store },
     { key: "creator", label: "Content Creator", icon: Video },
+    { key: "schedule", label: "Schedule", icon: CalendarClock },
   ],
 };
 
@@ -3533,6 +3990,29 @@ function App() {
         .goal-pic-select{font-family:'Inter',sans-serif;font-size:13px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);max-width:170px;}
         .sec-toggle{display:flex;align-items:center;gap:8px;background:none;border:none;padding:4px 2px;cursor:pointer;color:var(--ink);font-family:inherit;}
         .sec-count{font-size:11px;font-weight:700;padding:1px 8px;border-radius:20px;background:var(--track);color:var(--ink-soft);}
+        .sch-seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;}
+        .sch-seg button{background:none;border:none;padding:8px 12px;font-size:13px;font-weight:600;cursor:pointer;color:var(--ink-soft);font-family:inherit;}
+        .sch-seg button.active{background:var(--pine);color:#fff;}
+        .cal{border:1px solid var(--line);border-radius:10px;background:var(--card);overflow:hidden;}
+        .cal-scroll{max-height:640px;overflow:auto;}
+        .cal-head{display:grid;grid-template-columns:56px repeat(var(--n),minmax(90px,1fr));position:sticky;top:0;z-index:4;background:var(--card);border-bottom:1px solid var(--line);}
+        .cal-head > div{padding:8px 4px;text-align:center;font-size:11.5px;color:var(--ink-soft);display:flex;flex-direction:column;align-items:center;gap:2px;}
+        .cal-head .num{font-size:16px;color:var(--ink);width:30px;height:30px;line-height:30px;border-radius:50%;font-weight:600;}
+        .cal-head .today .num{background:var(--pine);color:#fff;}
+        .cal-body{display:grid;grid-template-columns:56px repeat(var(--n),minmax(90px,1fr));}
+        .cal-hours div{height:48px;font-size:10.5px;color:var(--ink-soft);text-align:right;padding:0 8px 0 0;box-sizing:border-box;position:relative;top:-7px;}
+        .cal-col{position:relative;border-left:1px solid var(--line);background-image:repeating-linear-gradient(to bottom,transparent 0,transparent 47px,var(--line) 47px,var(--line) 48px);}
+        .cal-ev{position:absolute;border-radius:5px;border-left:3px solid;padding:2px 6px;font-size:11.5px;overflow:hidden;cursor:pointer;box-sizing:border-box;display:flex;flex-direction:column;line-height:1.3;}
+        .cal-ev b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .cal-ev span{font-size:10.5px;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .cal-ev:hover{filter:brightness(.96);z-index:2;}
+        .cal-now{position:absolute;left:0;right:0;height:2px;background:#d64545;z-index:3;pointer-events:none;}
+        .cal-note{padding:8px 12px;font-size:11.5px;color:var(--ink-soft);border-top:1px solid var(--line);}
+        .sch-nav{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 14px;}
+        .sch-nav input[type=date]{font-family:'Inter',sans-serif;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
+        .sch-pic-filter{margin-left:auto;font-family:'Inter',sans-serif;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);}
+        .sch-day{display:flex;align-items:baseline;gap:12px;margin-bottom:10px;font-size:14px;}
+        .sch-day span{font-size:12px;color:var(--ink-soft);}
         .sec-title{font-family:'Fraunces',serif;font-size:16px;margin:4px 0 10px;}
         .stairs-card{margin-bottom:22px;}
         .stairs-scroll{overflow-x:auto;padding-top:6px;}
@@ -3900,6 +4380,7 @@ function App() {
             {tab === "budget" && canAccess("budget") && <BudgetTab data={data} update={update} appSave={appSave} subTab={finSubTab} setSubTab={setFinSubTab} />}
             {tab === "career" && canAccess("career") && <CareerTab data={data} update={update} appSave={appSave} />}
             {tab === "creator" && canAccess("creator") && <CreatorTab data={data} update={update} appSave={appSave} />}
+            {tab === "schedule" && canAccess("schedule") && <ScheduleTab data={data} update={update} appSave={appSave} />}
             {tab === "business" && canAccess("business") && <BusinessTab data={data} update={update} appSave={appSave} />}
             {tab === "masterdata" && canAccess("masterdata") && <MasterDataTab data={data} update={update} appSave={appSave} />}
             {tab === "usermanagement" && canAccess("usermanagement") && (
